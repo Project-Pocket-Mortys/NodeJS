@@ -26,7 +26,6 @@ Copy package.json and server.js to a directory of your choosing then go to your 
 This will install all the currently required libraries
 
 ## To Do
-- Battle & catch mortys
 - Battle Bots
 - Battle friends
 - Raid & other event Battles
@@ -36,6 +35,7 @@ This will install all the currently required libraries
 - Challenges
 
 ## Completed
+- <s>Battle & catch mortys</s>
 - <s>Lock Morties</s>
 - <s>Fix item spawning</s>
 - <s>Fix Morties roaming</s>
