@@ -72,4 +72,4 @@ This project is licensed under the **GNU General Public License v3.0 (GPLv3)**.
 If you use, fork, clone, modify, or convert this code, you are legally required under the terms of the GPLv3 to keep the source open-source and **clearly credit**: 
 
 **ConspiracyRick – Project Pocket Mortys**  
-https://github.com/ConspiracyRick/Project-Pocket-Mortys
+https://github.com/Project-Pocket-Mortys
