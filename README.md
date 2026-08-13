@@ -7,7 +7,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/node.js-red?style=for-the-badge&amp;logo=nodedotjs" />
-  <img src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge&amp;logo=github" />
+  <img src="https://img.shields.io/badge/license-GPLv3-blue?style=for-the-badge&amp;logo=github" />
 </p>
 
 ## Overview
@@ -67,10 +67,9 @@ Use GitHub Issues for bug reports and feature requests.
 
 ## License & Attribution
 
-This project is licensed under the MIT License.
+This project is licensed under the **GNU General Public License v3.0 (GPLv3)**. 
 
-If you use this code in another project, server, fork, clone or convert this code, 
+If you use, fork, clone, modify, or convert this code, you are legally required under the terms of the GPLv3 to keep the source open-source and **clearly credit**: 
 
-You **MUST credit**: **ConspiracyRick – Project Pocket Mortys** for all the work done.
-
+**ConspiracyRick – Project Pocket Mortys**  
 https://github.com/ConspiracyRick/Project-Pocket-Mortys
