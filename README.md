@@ -21,6 +21,10 @@ This repository contains the server-side components required to support client a
 - MySQL or MariaDB
 - Apache or Nginx
 
+## Instructions
+Copy package.json and server.js to a directory of your choosing then go to your command line and type in "npm install" without the quotes.
+This will install all the currently required libraries
+
 ## To Do
 - Battle & catch mortys
 - Battle Bots
