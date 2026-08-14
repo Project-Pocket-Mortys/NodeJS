@@ -38,7 +38,7 @@ if (ini_get("session.use_cookies")) {
 session_destroy();
 
 // Redirect to login page
-header("Location: /support/");
+header("Location: /");
 exit;
 }
 ?>
@@ -97,16 +97,19 @@ body{
   font-family: var(--font);
   color: var(--text);
 
-  /* Portal background but with your original “3-radials + base” style */
-  background:
-    radial-gradient(1200px 700px at 20% 20%, rgba(56,255,106,0.26), transparent 55%),
-    radial-gradient(900px 600px at 80% 15%, rgba(46,232,255,0.20), transparent 52%),
-    radial-gradient(900px 700px at 70% 85%, rgba(183,255,60,0.12), transparent 55%),
-    var(--bg);
+      background-color: #0d1b15;
+      background-image: url('/images/bk.png');
+      background-repeat: no-repeat;
+      background-position: center center;
+      background-size: cover;
+      background-attachment: fixed;
+      -webkit-font-smoothing: antialiased;
 
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
+
+
 
 /* OPTIONAL: keep your page static (no crazy animation) */
 /* If you want a subtle “portal shimmer” add this back later. */
@@ -454,7 +457,7 @@ input:focus{
 
         if (json && json.success){
           showOk("Signed in! Redirecting…");
-          const redirectTo = json.redirect || "/support/dashboard/";
+          const redirectTo = json.redirect || "/dashboard/";
           setTimeout(() => location.href = redirectTo, 600);
         } else {
           showError((json && (json.message || json.error)) ? (json.message || json.error) : "Unexpected response.");

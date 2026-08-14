@@ -76,6 +76,6 @@ if ($remember === 1) {
 respond(200, [
   "success" => true,
   "message" => "Signed in.",
-  "redirect" => "/support/dashboard/",
+  "redirect" => "/dashboard",
   "token" => $token
 ]);

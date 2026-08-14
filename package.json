@@ -1,0 +1,15 @@
+{
+  "name": "pocket-mortys-game-server",
+  "version": "1.0.0",
+  "description": "Pocket Mortys",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.14.3"
+  }
+}

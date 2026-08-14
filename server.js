@@ -2,26 +2,342 @@ const express = require('express');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const mysql = require('mysql2/promise');
+const jwt = require('jsonwebtoken');
 const dgram = require('dgram');
 const udpServer = dgram.createSocket('udp4');
-const udpSessionRegistry = new Map();
 const livePlayerPositions = new Map();
-const udpClientEndpoints = new Map();
+const activeSseConnections = new Map();
+const SpawnedMorties = new Map();
+const SpawnedItems = new Map();
+const SpawnedBots = new Map();
+const Battles = new Map();
 const app = express();
 // Middleware to parse JSON body
 app.use(express.json());
 
+// Helper functions (assuming defined in scope)
+const parseIdList = (str) => String(str || "").split(',').map(id => id.trim()).filter(Boolean);
+const toBool = (val) => val === true || val === 1 || String(val).toLowerCase() === 'true';
+
 // ---------------- 1. DATABASE CONFIGURATION ----------------
 const pool = mysql.createPool({
     host: 'localhost',
-    user: 'db_username',
-    password: 'db_password',
-    database: 'db_name',
+    user: 'yourusername',
+    password: 'yourpassword',
+    database: 'yourdatabase',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
 });
 
+// ==================== CONFIGS & HELPERS ====================
+const PICKUPS_CONFIG = {
+    count: 3,
+    crate: {
+        probability: 0.2,
+        contains_min: 2,
+        contains_max: 3,
+        coins_min: 100,
+        coins_max: 200,
+        contents: [
+            { type: "ITEM", amount: 1, item_id: "ItemMortyChip", rarity: 50 },
+            { type: "ITEM", amount: 1, item_id: "ItemSerum", rarity: 100 },
+            { type: "ITEM", amount: 1, item_id: "ItemHalzinger", rarity: 25 },
+            { type: "ITEM", amount: 1, item_id: "ItemPoisonCure", rarity: 75 },
+            { type: "ITEM", amount: 1, item_id: "ItemParalysisCure", rarity: 75 },
+            { type: "ITEM", amount: 1, item_id: "ItemPlutonicRock", rarity: 100 },
+            { type: "ITEM", amount: 1, item_id: "ItemMegaSeedAttack", rarity: 5 },
+            { type: "ITEM", amount: 1, item_id: "ItemMegaSeedDefence", rarity: 5 },
+            { type: "ITEM", amount: 1, item_id: "ItemMegaSeedSpeed", rarity: 5 }
+        ]
+    },
+    contents: [
+        { type: "ITEM", amount: 1, item_id: "ItemBattery", rarity: 100 },
+        { type: "ITEM", amount: 1, item_id: "ItemFleeb", rarity: 100 },
+        { type: "ITEM", amount: 1, item_id: "ItemBacteriaCell", rarity: 100 },
+        { type: "ITEM", amount: 1, item_id: "ItemCircuitBoard", rarity: 100 },
+        { type: "ITEM", amount: 1, item_id: "ItemDarkEnergyBall", rarity: 100 },
+        { type: "ITEM", amount: 1, item_id: "ItemTinCan", rarity: 100 },
+        { type: "ITEM", amount: 1, item_id: "ItemCable", rarity: 100 },
+        { type: "ITEM", amount: 1, item_id: "ItemTurbulentJuiceTube", rarity: 100 }
+    ]
+};
+
+const PICKUP_PLACEMENTS = [
+    [65, 79], [2, 79], [48, 87], [34, 83],
+    [8, 57], [57, 48], [25, 87], [42, 64]
+];
+
+const WILD_MORTIES_CONFIG = {
+    count: 8,
+    morties: [
+        { morty_id: "MortyScruffy", rarity: 100 },
+        { morty_id: "MortyOld", rarity: 100 },
+        { morty_id: "MortyRabbit", rarity: 100 },
+        { morty_id: "MortyStrawberry", rarity: 100 },
+        { morty_id: "MortyBlueShirt", rarity: 100 },
+        { morty_id: "MortySpoon", rarity: 100 },
+        { morty_id: "MortySpooky", rarity: 100 },
+        { morty_id: "MortyGreaser", rarity: 100 },
+        { morty_id: "MortyStrayCat", rarity: 100 },
+        { morty_id: "MortyVNeck", rarity: 100 },
+        { morty_id: "MortyMullet", rarity: 100 },
+        { morty_id: "MortyBirdosaur", rarity: 100 },
+        { morty_id: "MortySurvivor", rarity: 100 },
+        { morty_id: "MortyRookie", rarity: 100 },
+        { morty_id: "MortyFawn", rarity: 20 },
+        { morty_id: "MortyMascot", rarity: 20 },
+        { morty_id: "MortyCowboy", rarity: 20 },
+        { morty_id: "MortyCup", rarity: 20 },
+        { morty_id: "MortyPunk", rarity: 20 },
+        { morty_id: "MortySexyDevil", rarity: 20 },
+        { morty_id: "MortyWildMascot", rarity: 5 },
+        { morty_id: "MortyAnimatronic", rarity: 5 },
+        { morty_id: "MortyEgg", rarity: 5 }
+    ]
+};
+
+const WILD_MORTY_PLACEMENTS = [
+    [21, 84], [12, 84], [5, 82], [32, 72], [38, 82],
+    [49, 84], [15, 4], [61, 68], [42, 75], [13, 56],
+    [24, 57], [52, 61], [61, 33], [36, 59], [24, 76],
+    [55, 79], [37, 76], [13, 62], [32, 76], [47, 68]
+];
+
+function shuffleArray(array) {
+    const arr = [...array];
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+}
+
+function getWeightedRandom(pool, defaultRarity = 1) {
+    const validPool = pool.map(item => ({
+        ...item,
+        weight: typeof item.rarity === 'number' ? item.rarity : defaultRarity
+    }));
+    const totalWeight = validPool.reduce((sum, item) => sum + item.weight, 0);
+    let randomNum = Math.random() * totalWeight;
+
+    for (const item of validPool) {
+        if (randomNum < item.weight) return item;
+        randomNum -= item.weight;
+    }
+    return validPool[0];
+}
+
+function getRandomInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+// ==================== EXACT CLIENT SCHEMAS ====================
+function populateRoomPickups(roomId) {
+    const key = String(roomId);
+    const shuffledPlacements = shuffleArray(PICKUP_PLACEMENTS);
+    const formattedPickups = [];
+
+    for (let i = 0; i < PICKUPS_CONFIG.count; i++) {
+        const placement = shuffledPlacements[i];
+        const isCrate = Math.random() < PICKUPS_CONFIG.crate.probability;
+        const pickupId = `${isCrate ? 'crate' : 'pickup'}_${Date.now()}_${i}_${getRandomInt(100, 999)}`;
+        const contents = [];
+
+        if (isCrate) {
+            const itemCount = getRandomInt(PICKUPS_CONFIG.crate.contains_min, PICKUPS_CONFIG.crate.contains_max);
+            const coins = getRandomInt(PICKUPS_CONFIG.crate.coins_min, PICKUPS_CONFIG.crate.coins_max);
+            
+            contents.push({ type: "COIN", amount: coins });
+            for (let c = 0; c < itemCount; c++) {
+                const item = getWeightedRandom(PICKUPS_CONFIG.crate.contents);
+                contents.push({ type: item.type, amount: item.amount, item_id: item.item_id, rarity: item.rarity });
+            }
+        } else {
+            const item = getWeightedRandom(PICKUPS_CONFIG.contents);
+            contents.push({ type: item.type, amount: item.amount, item_id: item.item_id, rarity: item.rarity });
+        }
+
+        formattedPickups.push({
+            pickup_id: String(pickupId),
+            placement: [Number(placement[0]), Number(placement[1])],
+            contents: contents
+        });
+    }
+
+    SpawnedItems.set(key, formattedPickups);
+    return formattedPickups;
+}
+
+function populateRoomMorties(roomId) {
+    const key = String(roomId);
+    const shuffledPlacements = shuffleArray(WILD_MORTY_PLACEMENTS);
+    const safeDate = new Date().toISOString();
+    const formattedMorties = [];
+
+    for (let i = 0; i < WILD_MORTIES_CONFIG.count; i++) {
+        const placement = shuffledPlacements[i];
+        const selected = getWeightedRandom(WILD_MORTIES_CONFIG.morties, 0);
+        const wildMortyId = `wild_morty_${Date.now()}_${i}_${getRandomInt(100, 999)}`;
+
+        formattedMorties.push({
+            morty_id: String(selected.morty_id),
+            placement: [Number(placement[0]), Number(placement[1])],
+            state: "WORLD",
+            division: getRandomInt(1, 4), // Matches schema range 1-4
+            variant: "Normal",
+            shiny_if_potion: Math.random() < 0.2, // Realistic shiny distribution
+            _created: safeDate,
+            _updated: safeDate,
+            wild_morty_id: String(wildMortyId)
+        });
+    }
+
+    SpawnedMorties.set(key, formattedMorties);
+    return formattedMorties;
+}
+
+function respawnWildMorty(roomId, oldWildMortyId) {
+    const key = String(roomId);
+    let morties = SpawnedMorties.get(key) || [];
+
+    // 1. Remove the defeated/caught Morty from memory
+    morties = morties.filter(m => m.wild_morty_id !== oldWildMortyId);
+
+    // 2. Pick a placement coordinates set not currently occupied by remaining Morties
+    const usedPlacements = new Set(morties.map(m => `${m.placement[0]},${m.placement[1]}`));
+    const availablePlacements = WILD_MORTY_PLACEMENTS.filter(
+        p => !usedPlacements.has(`${p[0]},${p[1]}`)
+    );
+
+    // Fallback to full list if all coordinates are occupied
+    const poolToPickFrom = availablePlacements.length > 0 ? availablePlacements : WILD_MORTY_PLACEMENTS;
+    const placement = poolToPickFrom[Math.floor(Math.random() * poolToPickFrom.length)];
+
+    // 3. Generate the replacement Morty
+    const selected = getWeightedRandom(WILD_MORTIES_CONFIG.morties, 0);
+    const safeDate = new Date().toISOString();
+    const newWildMortyId = `wild_morty_${Date.now()}_${getRandomInt(100, 999)}`;
+
+    const newMorty = {
+        morty_id: String(selected.morty_id),
+        placement: [Number(placement[0]), Number(placement[1])],
+        state: "WORLD",
+        division: getRandomInt(1, 4),
+        variant: "Normal",
+        shiny_if_potion: Math.random() < 0.2,
+        _created: safeDate,
+        _updated: safeDate,
+        wild_morty_id: String(newWildMortyId)
+    };
+
+    // 4. Save back to memory map
+    morties.push(newMorty);
+    SpawnedMorties.set(key, morties);
+
+    return newMorty;
+}
+
+function getOrPopulateRoomItems(roomId) {
+    const key = String(roomId);
+    return SpawnedItems.has(key) ? SpawnedItems.get(key) : populateRoomPickups(key);
+}
+
+function getOrPopulateRoomMorties(roomId) {
+    const key = String(roomId);
+    return SpawnedMorties.has(key) ? SpawnedMorties.get(key) : populateRoomMorties(key);
+}
+
+// Random spawn locations for bots
+const BOT_PLACEMENTS = [
+    [49, 84], [24, 76], [24, 57], [30, 45], [40, 60], 
+    [15, 20], [60, 30], [55, 75]
+];
+
+// Array of possible bot avatars
+const BOT_AVATARS = [
+    "AvatarRickDefault", 
+    "AvatarTycoonRick", // Replaced AvatarRickBusiness
+    "AvatarCopRick",    // Fixed from AvatarRickCop
+    "AvatarRickAqua", 
+    "AvatarRickDoofus"
+];
+
+function populateRoomBots(roomId, playerLevel = 1) {
+    const key = String(roomId);
+    const bots = [];
+    const botCount = 3; // Adjust how many bots you want per room
+    const shuffledPlacements = shuffleArray(BOT_PLACEMENTS);
+
+    for (let i = 0; i < botCount; i++) {
+        const placement = shuffledPlacements[i % shuffledPlacements.length];
+        const botId = `bot_${Date.now()}_${i}_${getRandomInt(1000, 9999)}`;
+        
+        // Fluctuate the bot's level slightly around the player's level (e.g., -1 to +2)
+        const botLevel = Math.max(1, playerLevel + getRandomInt(-1, 2));
+        
+        // Give the bot 1 to 3 random Morties
+        const numMorties = getRandomInt(1, 3);
+        const owned_morties = [];
+        
+        for (let j = 0; j < numMorties; j++) {
+            // Re-using your WILD_MORTIES_CONFIG pool
+            const selectedMorty = getWeightedRandom(WILD_MORTIES_CONFIG.morties, 1);
+            owned_morties.push({
+                owned_morty_id: `bot_morty_${Date.now()}_${j}_${getRandomInt(100, 999)}`,
+                morty_id: String(selectedMorty.morty_id),
+                hp: 20 + (botLevel * 2), // Arbitrary HP scaling if the client relies on it
+                variant: "Normal"
+            });
+        }
+
+        bots.push({
+            bot_id: botId,
+            username: "Bot",
+            player_avatar_id: BOT_AVATARS[getRandomInt(0, BOT_AVATARS.length - 1)],
+            state: "WORLD",
+            level: botLevel,
+            owned_morties: owned_morties,
+            shiny_if_potion: true,
+            streak: 0,
+            placement: [Number(placement[0]), Number(placement[1])]
+        });
+    }
+
+    SpawnedBots.set(key, bots);
+    return bots;
+}
+
+function getOrPopulateRoomBots(roomId, playerLevel = 1) {
+    const key = String(roomId);
+    return SpawnedBots.has(key) ? SpawnedBots.get(key) : populateRoomBots(key, playerLevel);
+}
+
+// --- SERVER-DRIVEN WORLD INITIALIZATION ---
+async function initializeWorldRooms() {
+    try {
+        console.log(">>> Initializing world rooms and pre-spawning entities...");
+        const [rooms] = await pool.execute("SELECT room_id FROM room_ids");
+        
+        for (const room of rooms) {
+            const rId = String(room.room_id);
+            // Server generates everything autonomously
+            populateRoomPickups(rId);
+            populateRoomMorties(rId);
+            populateRoomBots(rId, 1); // Default level 1 baseline on boot
+        }
+        console.log(`>>> Successfully pre-spawned entities for ${rooms.length} rooms.`);
+    } catch (err) {
+        console.error(">>> Error during world room initialization:", err);
+    }
+}
+
+initializeWorldRooms();
+
+// Express health check endpoint
+app.get('/', (req, res) => {
+  res.status(200).json();
+});
 
 // ---------------- HELPERS ----------------
 async function requireUserBySession(sessionId) {
@@ -33,19 +349,18 @@ async function requireUserBySession(sessionId) {
     }
     return rows[0];
 }
-const activeSseConnections = new Map();
 
-// Clean stale database sessions (Players who haven't pinged or seen in 45 seconds)
+// Clean stale database sessions (Players who haven't pinged or seen in 60 seconds)
 setInterval(async () => {
     try {
-        // 1. Fetch all players who are inside a valid room but haven't updated 'last_seen' in 45 seconds
+        // 1. Fetch all players who are inside a valid room but haven't updated 'last_seen' in 60 seconds
         const [stalePlayers] = await pool.execute(`
             SELECT player_id, room_id 
             FROM users 
             WHERE room_id IS NOT NULL 
               AND room_id != '0' 
               AND room_id != '' 
-              AND last_seen < NOW() - INTERVAL 45 SECOND
+              AND last_seen < NOW() - INTERVAL 60 SECOND
         `);
 
         for (const player of stalePlayers) {
@@ -64,8 +379,7 @@ setInterval(async () => {
 
             // 3. Broadcast the 'room:user-removed' event via your SSE event queue pipeline
             // This alerts every other client in that map to instantly destroy the player's avatar
-            await publishEvent(room_id,"room:user-removed",{ player_id: player_id },player_id).catch(err => console.error(`[Timeout Worker] SSE Publish failed:`, err.message));
-            //await publishEvent(room_id,"room:user-removed",player_id).catch(err => console.error(`[Timeout Worker] SSE Publish failed:`, err.message));
+			await publishEvent(String(room_id), "room:user-removed", { room_id: String(room_id), player_id: String(player_id) }, player_id);
 			
             // 4. Optional: Clean up their streaming references if they are still tracked in memory
             if (typeof activeSseConnections !== 'undefined' && activeSseConnections.has(player_id)) {
@@ -199,6 +513,20 @@ async function getActiveDeckMorties(playerId) {
     return ordered;
 }
 
+function broadcastSSE(eventName, payload) {
+    const data = typeof payload === "string"
+        ? payload
+        : JSON.stringify(payload);
+
+    for (const [player_id, sseSend] of activeSseConnections) {
+        try {
+            sseSend(eventName, data);
+        } catch (err) {
+            console.error(`SSE failed for ${player_id}:`, err);
+        }
+    }
+}
+
 // ---------------- 4. CORE COMPREHENSIVE EVENT PUBLISHER (From events.php) ----------------
 
 async function publishEvent(roomId, event, payload, playerId = null) {
@@ -215,11 +543,13 @@ async function publishEvent(roomId, event, payload, playerId = null) {
     let bot_id = null;
     let username = null;
     let player_avatar_id = null;
+	let level = 1;
     let owned_morties = null;
     let battle_start = null;
     let get_current_raid = null;
     let battle_turn_result = null;
     let battle_move_timer_started = null;
+	let battle_invite_recieved = null;
     let emote = null;
     let only_show_to_player_id = null;
 
@@ -254,19 +584,23 @@ async function publishEvent(roomId, event, payload, playerId = null) {
         owned_morties = payload.owned_morties ? JSON.stringify(payload.owned_morties) : JSON.stringify([]);
     }
 
-    if (event === "shard:raid-boss-state-changed") {
-        get_current_raid = JSON.stringify(payload);
-    }
+    //if (event === "shard:raid-boss-state-changed") {
+        //get_current_raid = JSON.stringify(payload);
+		//console.log(get_current_raid);
+    //}
 
     if (event === "room:user-added") {
         roomId = payload.room_id || null;
         playerId = payload.player_id || null;
         state = payload.state || null;
         username = payload.username || null;
+		level = payload.level || null;
         player_avatar_id = payload.player_avatar_id || null;
+		placement = payload.placement || null;
     }
 
     if (event === "room:user-removed") {
+		roomId = payload.room_id || null;
         playerId = payload.player_id || null;
     }
 
@@ -289,6 +623,11 @@ async function publishEvent(roomId, event, payload, playerId = null) {
         battle_start = JSON.stringify(payload);
         only_show_to_player_id = playerId;
     }
+	
+	if (event === "battle-invite:received") {
+        battle_invite_recieved = JSON.stringify(payload);
+        only_show_to_player_id = playerId;
+    }
 
     if (event === "battle:turn-result") {
         battle_turn_result = JSON.stringify(payload);
@@ -302,20 +641,32 @@ async function publishEvent(roomId, event, payload, playerId = null) {
         playerId = payload.player_id || null;
         emote = payload.emote || null;
     }
+	
+    if (event === "room:user-modified") {
+        playerId = payload.player_id || null;
+        state = payload.state || null;
+        username = payload.username || null;
+		level = payload.level || null;
+        player_avatar_id = payload.player_avatar_id
+    }
+	
+	if (event === "room:wild-morty-removed") {
+        wild_morty_id = payload.wild_morty_id;
+    }
 
     const query = `
         INSERT INTO event_queue (
             room_id, event_name, player_id, emote, current_raid, battle_start, 
-            battle_turn_result, battle_move_timer_started, bot_id, username, 
-            player_avatar_id, wild_morty_id, morty_id, placement, state, 
+            battle_turn_result, battle_move_timer_started, battle_invite_recieved, bot_id, username, 
+            player_avatar_id, player_level, wild_morty_id, morty_id, placement, state, 
             division, zone_id, variant, shiny_if_potion, pickup_id, 
             pick_up_contents, owned_morties, only_show_to_player_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
     await pool.execute(query, [
         roomId, event, playerId, emote, get_current_raid, battle_start,
-        battle_turn_result, battle_move_timer_started, bot_id, username,
-        player_avatar_id, wild_morty_id, morty_id, placement, state,
+        battle_turn_result, battle_move_timer_started, battle_invite_recieved, bot_id, username,
+        player_avatar_id, level, wild_morty_id, morty_id, placement, state,
         division, zone_id, variant, shiny_if_potion, pickup_id,
         pick_up_contents, owned_morties, only_show_to_player_id
     ]);
@@ -413,7 +764,7 @@ app.post('/user/login', async (req, res) => {
         const tags = user.tags;
         
         const session_id = crypto.randomUUID(); 
-        const ping_url = 'https://game.conspiracyrick.com/session/ping-dynamic';
+        const ping_url = 'https://dev-game.conspiracyrick.com/session/ping-dynamic';
         
         const iat = Math.floor(Date.now() / 1000); 
         const exp = iat + 60; 
@@ -447,7 +798,7 @@ app.post('/user/login', async (req, res) => {
         const jwt = `${base64Header}.${base64Payload}.${base64Signature}`;
 
         const responseData = {
-            session_url: `https://game.conspiracyrick.com/sse/?token=${jwt}`,
+            session_url: `https://dev-game.conspiracyrick.com/sse/?token=${jwt}`,
             session_url_ttl: "60"
         };
 
@@ -543,7 +894,7 @@ app.get('/sse', async (req, res) => {
 
     const player_id = String(user.player_id);
     const tags = normalizeTags(user.tags);
-    const ping_url = String(profile?.ping_url || "https://game.conspiracyrick.com/session/ping-dynamic");
+    const ping_url = String(profile?.ping_url || "https://dev-game.conspiracyrick.com/session/ping-dynamic");
 
     // --- 1. REGISTER CONNECTION FOR DYNAMIC PING ROUTING ---
     activeSseConnections.set(player_id, sseSend);
@@ -588,8 +939,6 @@ app.get('/sse', async (req, res) => {
 
         if (room_id !== "" && room_id !== "0") break;
 
-        // Note: Automatic fallback pings are omitted here because /session/ping-dynamic 
-        // drives the keep-alive timeline for the client directly.
         await new Promise(resolve => setTimeout(resolve, 250));
     }
 
@@ -606,72 +955,69 @@ app.get('/sse', async (req, res) => {
     let last_id = 0;
 
     if (isFreshConnect) {
-        const [pickups] = await pool.execute(
-            `SELECT id, pickup_id, placement, pick_up_contents FROM event_queue 
-             WHERE room_id = ? AND event_name = 'room:pickup-added' AND pickup_id_collected_by_player_id IS NULL ORDER BY id ASC`, [room_id]
-        );
-        for (const p of pickups) {
-            const coords = String(p.placement || "0,0").split(",");
+        // -----------------------------------------------------------
+        // 1. FETCH CACHED/POPULATED ROOM PICKUPS FROM MAP
+        // -----------------------------------------------------------
+        const roomPickups = getOrPopulateRoomItems(room_id);
+        
+        roomPickups.forEach((pickup) => {
             sseSend("room:pickup-added", JSON.stringify({
-                pickup_id: p.pickup_id,
-                placement: [parseInt(coords[0] || 0, 10), parseInt(coords[1] || 0, 10)],
-                contents: JSON.parse(p.pick_up_contents || "[]")
-            }), p.id);
-        }
+                pickup_id: pickup.pickup_id,
+                placement: pickup.placement,
+                contents: pickup.contents
+            }));
+        });
 
-        const [wilds] = await pool.execute(
-            `SELECT id, wild_morty_id, morty_id, placement, state, division, variant, shiny_if_potion FROM event_queue 
-             WHERE room_id = ? AND event_name = 'room:wild-morty-added' ORDER BY id ASC`, [room_id]
-        );
-        for (const w of wilds) {
-            const coords = String(w.placement || "0,0").split(",");
+        // -----------------------------------------------------------
+        // 2. FETCH CACHED/POPULATED ROOM WILD MORTIES FROM MAP
+        // -----------------------------------------------------------
+        const roomMorties = getOrPopulateRoomMorties(room_id);
+        
+        roomMorties.forEach((morty) => {
             sseSend("room:wild-morty-added", JSON.stringify({
-                morty_id: w.morty_id,
-                placement: [parseInt(coords[0] || 0, 10), parseInt(coords[1] || 0, 10)],
-                state: w.state || "WORLD",
-                division: parseInt(w.division || 1, 10),
-                variant: w.variant || "Normal",
-                shiny_if_potion: Boolean(w.shiny_if_potion),
-                _created: new Date().toISOString(),
-                _updated: new Date().toISOString(),
-                wild_morty_id: w.wild_morty_id
-            }), w.id);
-        }
+                morty_id: morty.morty_id,
+                placement: morty.placement,
+                state: morty.state || "WORLD",
+                division: morty.division || 1,
+                variant: morty.variant || "Normal",
+                shiny_if_potion: Boolean(morty.shiny_if_potion),
+                _created: morty._created || new Date().toISOString(),
+                _updated: morty._updated || new Date().toISOString(),
+                wild_morty_id: morty.wild_morty_id
+            }));
+        });
 
-        const [bots] = await pool.execute(
-            `SELECT id, bot_id, username, player_avatar_id, placement, state, owned_morties FROM event_queue 
-             WHERE room_id = ? AND event_name = 'room:bot-added' ORDER BY id ASC`, [room_id]
-        );
-        for (const b of bots) {
-            const coords = String(b.placement || "0,0").split(",");
+        // -----------------------------------------------------------
+        // 3. FETCH CACHED/POPULATED BOTS FROM MAP
+        // -----------------------------------------------------------
+        const playerLevelForBots = parseInt(user.level || 1, 10);
+        const roomBots = getOrPopulateRoomBots(room_id, playerLevelForBots);
+        
+        roomBots.forEach((b) => {
             sseSend("room:bot-added", JSON.stringify({
                 username: b.username,
                 player_avatar_id: b.player_avatar_id,
                 state: b.state || "WORLD",
-                level: 1,
-                owned_morties: JSON.parse(b.owned_morties || "[]"),
-                streak: 0,
+                level: b.level,
+                owned_morties: b.owned_morties,
+                streak: b.streak,
                 bot_id: b.bot_id,
-                placement: [parseInt(coords[0] || 0, 10), parseInt(coords[1] || 0, 10)]
-            }), b.id);
-        }
-
+                placement: b.placement
+            }));
+        });
+        
         last_id = await roomMaxEventId(room_id);
-        //await cursorSet(player_id, last_id);
     } else {
         last_id = clientLastEventId;
-        //await cursorSet(player_id, last_id);
     }
 
-    const privateEvents = ["battle:start", "battle:move-timer-started", "battle:turn-result"];
+    const privateEvents = ["battle:start", "battle:move-timer-started", "battle:turn-result", "battle-invite:received"];
 
     // Core Event Streaming Loop
     while (connectionActive) {
-        //await pool.execute("UPDATE users SET last_seen = NOW() WHERE player_id = ?", [player_id]);
-
         const [events] = await pool.execute(
             `SELECT id, room_id, event_name, player_id, emote, current_raid, battle_start, battle_turn_result, 
-                    battle_move_timer_started, bot_id, username, player_avatar_id, wild_morty_id, morty_id, 
+                    battle_move_timer_started, battle_invite_recieved, bot_id, username, player_avatar_id, player_level, wild_morty_id, morty_id, 
                     placement, state, division, zone_id, variant, shiny_if_potion, pickup_id, pick_up_contents, 
                     owned_morties, only_show_to_player_id 
              FROM event_queue WHERE room_id = ? AND id > ? ORDER BY id ASC LIMIT 200`,
@@ -701,6 +1047,7 @@ app.get('/sse', async (req, res) => {
 
             switch (eventName) {
                 case "room:pickup-added": {
+					const placementArr = JSON.parse(row.placement);
                     payload = JSON.stringify({
                         pickup_id: row.pickup_id,
                         placement: placementArr,
@@ -722,6 +1069,12 @@ app.get('/sse', async (req, res) => {
                     });
                     break;
                 }
+                case "room:wild-morty-removed": {
+                    payload = JSON.stringify({
+                        wild_morty_id: row.wild_morty_id
+                    });
+                    break;
+                }
                 case "room:bot-added": {
                     payload = JSON.stringify({
                         username: row.username,
@@ -733,10 +1086,6 @@ app.get('/sse', async (req, res) => {
                         bot_id: row.bot_id,
                         placement: placementArr
                     });
-                    break;
-                }
-                case "shard:raid-boss-state-changed": {
-                    payload = String(row.current_raid || "");
                     break;
                 }
                 case "room:bot-state-changed": {
@@ -775,17 +1124,20 @@ app.get('/sse', async (req, res) => {
                     break;
                 }
                 case "room:user-added": {
-                    const [uRows] = await pool.execute("SELECT * FROM users WHERE player_id = ?", [row.player_id]);
-                
+                    if (player_id === row.player_id) {
+                        last_id = eid;
+                        continue;
+                    }
                     const activeDeck = await getActiveDeckMorties(row.player_id);
+                    const playerPlacement = JSON.parse(row.placement || "[0,0]");
                     payload = JSON.stringify({
                         player_id: row.player_id,
                         username: String(row.username || ""),
                         player_avatar_id: String(row.player_avatar_id || ""),
-                        level: row.level,
+                        level: row.player_level,
                         owned_morties: activeDeck,
                         state: row.state || "WORLD",
-                        placement: [30, 35] 
+                        placement: playerPlacement
                     });
                     break;
                 }
@@ -793,18 +1145,20 @@ app.get('/sse', async (req, res) => {
                     payload = JSON.stringify({ player_id: row.player_id });
                     break;
                 }
-				case "room:user-modified": {
-                    const [uRows] = await pool.execute("SELECT * FROM users WHERE player_id = ?", [row.player_id]);
-                
+                case "room:user-modified": {
                     const activeDeck = await getActiveDeckMorties(row.player_id);
                     payload = JSON.stringify({
-					    player_id: row.player_id,
-					    username: row.username,
-					    player_avatar_id: row.player_avatar_id || "AvatarRickDefault",
-					    level: row.level,
-					    owned_morties: activeDeck,
-					    state: row.state || "WORLD"
+                        player_id: row.player_id,
+                        username: row.username,
+                        player_avatar_id: row.player_avatar_id,
+                        level: row.level,
+                        owned_morties: activeDeck,
+                        state: row.state
                     });
+                    break;
+                }
+                case "battle-invite:received": {
+                    payload = String(row.battle_invite_recieved || "");
                     break;
                 }
                 default:
@@ -814,8 +1168,6 @@ app.get('/sse', async (req, res) => {
             sseSend(eventName, payload, eid);
             last_id = eid;
         }
-
-        //await cursorSet(player_id, last_id);
         
         await new Promise(resolve => setTimeout(resolve, 100)); // 10 ticks per second
     }
@@ -824,7 +1176,6 @@ app.get('/sse', async (req, res) => {
 });
 
 // -------------------- 8. PLAYER DETAILS & INVENTORY --------------------
-
 app.post('/session/player-details', async (req, res) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -843,11 +1194,7 @@ app.post('/session/player-details', async (req, res) => {
             [avatarRows],
             [dexRows]
         ] = await Promise.all([
-            pool.execute(`
-                SELECT m.*, a.attack_id, a.position, a.pp, a.pp_stat 
-                FROM owned_morties m 
-                LEFT JOIN owned_attacks a ON m.owned_morty_id = a.owned_morty_id 
-                WHERE m.player_id = ? ORDER BY m.owned_morty_id ASC, a.position ASC`, [player_id]),
+		    pool.execute(`SELECT * FROM owned_morties WHERE player_id = ? ORDER BY owned_morty_id ASC`, [player_id]),
             pool.execute(`SELECT deck_id, owned_morty_ids FROM decks WHERE player_id = ?`, [player_id]),
             pool.execute(`SELECT item_id, quantity FROM owned_items WHERE player_id = ?`, [player_id]),
             pool.execute(`SELECT player_avatar_id FROM owned_avatars WHERE player_id = ? LIMIT 1`, [player_id]),
@@ -855,36 +1202,41 @@ app.post('/session/player-details', async (req, res) => {
         ]);
 
         const mortyMap = new Map();
+
         for (const row of mortyRows) {
-            if (!mortyMap.has(row.owned_morty_id)) {
-                mortyMap.set(row.owned_morty_id, {
-                    owned_morty_id: String(row.owned_morty_id),
-                    morty_id: String(row.morty_id),
-                    level: parseInt(row.level, 10),
-                    xp: parseInt(row.xp, 10),
-                    hp: parseInt(row.hp, 10),
-                    hp_stat: parseInt(row.hp_stat, 10),
-                    attack_stat: parseInt(row.attack_stat, 10),
-                    defence_stat: parseInt(row.defence_stat, 10),
-                    variant: row.variant || 'Normal',
-                    speed_stat: parseInt(row.speed_stat, 10),
-                    is_locked: [1, '1', true, 'true'].includes(row.is_locked),
-                    is_trading_locked: [1, '1', true, 'true'].includes(row.is_trading_locked),
-                    fight_pit_id: (!row.fight_pit_id || row.fight_pit_id === 'null') ? null : row.fight_pit_id,
-                    evolution_points: parseInt(row.evolution_points, 10),
-                    owned_attacks: [],
-                    xp_lower: parseInt(row.xp_lower || 0, 10),
-                    xp_upper: parseInt(row.xp_upper || 0, 10)
-                });
-            }
-            if (row.attack_id) {
-                mortyMap.get(row.owned_morty_id).owned_attacks.push({
-                    attack_id: String(row.attack_id),
-                    position: parseInt(row.position, 10),
-                    pp: parseInt(row.pp, 10),
-                    pp_stat: parseInt(row.pp_stat, 10)
-                });
-            }
+
+        let ownedAttacks = [];
+
+        try {
+            ownedAttacks = JSON.parse(row.attacks_array || "[]").map(a => ({
+                attack_id: String(a.attack_id),
+                position: parseInt(a.position),
+                pp: parseInt(a.pp),
+                pp_stat: parseInt(a.pp)
+            }));
+        } catch (e) {
+            ownedAttacks = [];
+        }
+
+            mortyMap.set(row.owned_morty_id, {
+                owned_morty_id: String(row.owned_morty_id),
+                morty_id: String(row.morty_id),
+                level: parseInt(row.level),
+                xp: parseInt(row.xp),
+                hp: parseInt(row.hp),
+                hp_stat: parseInt(row.hp_stat),
+                attack_stat: parseInt(row.attack_stat),
+                defence_stat: parseInt(row.defence_stat),
+                variant: row.variant,
+                speed_stat: parseInt(row.speed_stat),
+                is_locked: [1, '1', true, 'true'].includes(row.is_locked),
+                is_trading_locked: [1, '1', true, 'true'].includes(row.is_trading_locked),
+                fight_pit_id: (!row.fight_pit_id || row.fight_pit_id === 'null') ? null : row.fight_pit_id,
+                evolution_points: parseInt(row.evolution_points),
+                owned_attacks: ownedAttacks,
+                xp_lower: parseInt(row.xp_lower),
+                xp_upper: parseInt(row.xp_upper)
+            });
         }
 
         const activeDeckRow = deckRows.find(d => d.deck_id === user.active_deck_id);
@@ -934,8 +1286,8 @@ app.post('/session/player-details', async (req, res) => {
             mortydex: dexRows.map(r => ({ morty_id: String(r.morty_id), caught: Boolean(r.caught) })),
             tags: [],
             play_shiny_potion: null,
-            xp_lower: parseInt(user.xp_lower, 10),
-            xp_upper: parseInt(user.xp_upper, 10)
+            xp_lower: parseInt(user.xp_lower),
+            xp_upper: parseInt(user.xp_upper)
         });
 
     } catch (err) {
@@ -1729,8 +2081,6 @@ app.post('/session/dimensions/query', (req, res) => {
     return res.json(dimensionsData);
 });
 
-
-
 // -------------------- 12. JOIN ROOM --------------------
 app.post('/session/join-room', async (req, res) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -1822,10 +2172,24 @@ app.post('/session/join-room', async (req, res) => {
                 }
             }
 			
-            let currentPlacement = [30,35];
-
+			let currentPlacement;
+			// edit spawns here when our player joins.
             if (player_id === u.player_id) {
-                currentPlacement = [30,36];
+                if (world_id_in == 1){
+                    currentPlacement = [30, 35];
+                } else if (world_id_in == 2){
+                    currentPlacement = [21, 72];
+                } else if (world_id_in == 3){
+                    currentPlacement = [31, 50];
+                } else if (world_id_in == 4){
+                    currentPlacement = [31, 74];
+                } else if (world_id_in == 5){
+                    currentPlacement = [34, 15];
+                } else if (world_id_in == 6){
+                    currentPlacement = [49, 12];
+                } else if (world_id_in == 7){
+                    currentPlacement = [40, 84];
+                }
             } else {
                 const livePos = livePlayerPositions.get(u.player_id);
 
@@ -1841,79 +2205,18 @@ app.post('/session/join-room', async (req, res) => {
                 player_id: u.player_id,
                 username: u.username,
                 player_avatar_id: u.player_avatar_id,
-                level: parseInt(u.level || 1, 10),
+                level: u.level,
                 owned_morties: owned_morties,
-                state: u.state || "WORLD",
-				"shiny_if_potion": false,
-		        "streak": u.streak,
-				placement: currentPlacement // Handled and overwritten immediately by the active UDP server loop
+                state: u.state
+				//"shiny_if_potion": false,
+		        //"streak": u.streak,
+				//placement: currentPlacement // Handled and overwritten immediately by the active UDP server loop
             });
         }
 
-        const [pickupRows] = await pool.execute(
-            `SELECT pickup_id, placement, pick_up_contents FROM event_queue 
-             WHERE room_id = ? AND event_name = 'room:pickup-added' AND pickup_id_collected_by_player_id IS NULL`,
-            [room_id]
-        );
-
-        const pickups = pickupRows.map(p => {
-            const pos = String(p.placement || "0,0").split(",");
-            let contents = [];
-            try { contents = JSON.parse(p.pick_up_contents || "[]"); } catch(e) {}
-            if (contents && contents.type && !Array.isArray(contents)) { contents = [contents]; }
-
-            return {
-                pickup_id: p.pickup_id,
-                placement: [parseInt(pos[0] || 0, 10), parseInt(pos[1] || 0, 10)],
-                contents: Array.isArray(contents) ? contents : []
-            };
-        });
-
-        const [wildRows] = await pool.execute(
-            `SELECT * FROM event_queue WHERE room_id = ? AND event_name = 'room:wild-morty-added'`,
-            [room_id]
-        );
-
-        const wild_morties = wildRows.map(w => {
-            const pos = String(w.placement || "0,0").split(",");
-            const safeDate = w.created_at ? new Date(w.created_at).toISOString() : new Date().toISOString();
-            
-            return {
-                morty_id: w.morty_id,
-                placement: [parseInt(pos[0] || 0, 10), parseInt(pos[1] || 0, 10)],
-                state: w.state || "WORLD",
-                division: parseInt(w.division || 1, 10),
-                variant: w.variant || "Normal",
-                shiny_if_potion: Boolean(w.shiny_if_potion),
-                _created: safeDate,
-                _updated: safeDate,
-                wild_morty_id: w.wild_morty_id
-            };
-        });
-
-        const [botRows] = await pool.execute(
-            `SELECT bot_id, username, player_avatar_id, placement, state, division, zone_id, shiny_if_potion, owned_morties 
-             FROM event_queue WHERE room_id = ? AND event_name = 'room:bot-added'`,
-            [room_id]
-        );
-
-        const bots = botRows.map(b => {
-            const pos = String(b.placement || "0,0").split(",");
-            let parsedMorties = [];
-            try { parsedMorties = JSON.parse(b.owned_morties || "[]"); } catch(e) {}
-
-            return {
-                username: b.username,
-                player_avatar_id: b.player_avatar_id,
-                state: b.state || "WORLD",
-                level: 1,
-                owned_morties: parsedMorties,
-                shiny_if_potion: Boolean(b.shiny_if_potion),
-                streak: 0,
-                bot_id: b.bot_id,
-                placement: [parseInt(pos[0] || 0, 10), parseInt(pos[1] || 0, 10)]
-            };
-        });
+        const pickups = SpawnedItems.get(room_id) || populateRoomPickups(room_id);
+        const wild_morties = SpawnedMorties.get(room_id) || populateRoomMorties(room_id);
+        const bots = SpawnedBots.get(room_id) || populateRoomBots(room_id, parseInt(me.level || 1, 10));
 
         const responseData = {
             room_id: room.room_id,
@@ -1942,17 +2245,36 @@ app.post('/session/join-room', async (req, res) => {
         //);
 		
 		// --- BROADCAST PLAYER JOINED NOW THAT SSE PIPELINE IS ESTABLISHED ---
-        const [uRows] = await pool.execute("SELECT username, player_avatar_id, state FROM users WHERE player_id = ?", [player_id]);
+        const [uRows] = await pool.execute("SELECT username, player_avatar_id, level, state FROM users WHERE player_id = ?", [player_id]);
         if (uRows.length) {
+			let currentPlacement;
+
+            if (world_id_in == 1){
+                currentPlacement = [30, 35];
+            } else if (world_id_in == 2){
+                currentPlacement = [21, 72];
+            } else if (world_id_in == 3){
+                currentPlacement = [31, 50];
+            } else if (world_id_in == 4){
+                currentPlacement = [31, 74];
+            } else if (world_id_in == 5){
+                currentPlacement = [34, 14];
+            } else if (world_id_in == 6){
+                currentPlacement = [49, 12];
+            } else if (world_id_in == 7){
+                currentPlacement = [40, 84];
+			}
+			
             const publishPayload = {
                 room_id: room_id,
                 player_id: player_id,
                 username: uRows[0].username,
                 player_avatar_id: uRows[0].player_avatar_id,
-                state: uRows[0].state || "WORLD",
+				level: uRows[0].level,
+                state: uRows[0].state,
 				"shiny_if_potion": false,
 		        "streak": uRows[0].streak,
-                placement: [30, 35]
+                placement: currentPlacement
             };
             publishEvent(room_id, "room:user-added", publishPayload, player_id).catch(console.error);
         }
@@ -1964,6 +2286,14 @@ app.post('/session/join-room', async (req, res) => {
         return res.status(err.statusCode || 500).json({ error: err.message });
     }
 });
+
+
+
+
+
+
+
+
 
 // -------------------- LEAVE ROOM --------------------
 app.post('/session/leave-room', async (req, res) => {
@@ -1989,15 +2319,12 @@ app.post('/session/leave-room', async (req, res) => {
         // 2. Broadcast leave event to everyone else via your existing event queue publisher
         // We look up the room_id from the user profile just like the PHP script's query
         if (room_id && room_id !== "0" && room_id !== "") {
-            await publishEvent(
-                String(room_id), 
-                "room:user-removed", 
-                { player_id: String(player_id) }, 
-                player_id
-            );
+            await publishEvent(String(room_id), "room:user-removed", { room_id: String(room_id), player_id: String(player_id) }, player_id);
+			
+			//console.log("room id: ", String(room_id), "room:user-removed", {  room_id: String(room_id), player_id: String(player_id) }, player_id);
             
             // Optional: If you want to explicitly wipe their room status in the DB upon leaving:
-            // await pool.execute("UPDATE users SET room_id = '0', state = NULL WHERE player_id = ?", [player_id]);
+            await pool.execute("UPDATE users SET room_id = NULL, state = NULL WHERE player_id = ?", [player_id]);
         }
 
         // 3. Send clean success response
@@ -2326,7 +2653,9 @@ async function grantCoins(connection, playerId, amount) {
     };
 }
 
-// ROUTE HANDLER DEFINITION
+// ============================================================================
+// 📦 COLLECT PICKUP ROUTE (Removes old, generates & adds new to SpawnedItems)
+// ============================================================================
 app.post('/session/collect-pickup', async (req, res) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -2338,13 +2667,12 @@ app.post('/session/collect-pickup', async (req, res) => {
         return res.status(400).json({ error: "Missing session_id or pickup_id" });
     }
 
-    // Get a specific connection from the pool to execute multi-step transactions
     const connection = await pool.getConnection();
 
     try {
         await connection.beginTransaction();
 
-        // 1. Resolve and Lock player state row context
+        // 1. Resolve player and room context
         const [playerRows] = await connection.execute(`
             SELECT player_id, room_id FROM users 
             WHERE session_id = ? LIMIT 1 FOR UPDATE
@@ -2355,63 +2683,44 @@ app.post('/session/collect-pickup', async (req, res) => {
         }
 
         const playerId = playerRows[0].player_id;
-        const roomId = playerRows[0].room_id;
+        const roomId = String(playerRows[0].room_id);
 
-        // 2. Resolve and Lock targeting pickup row item status
-        const [pickupRows] = await connection.execute(`
-            SELECT id, pickup_id, placement, pick_up_contents 
-            FROM event_queue 
-            WHERE room_id = ? 
-              AND event_name = 'room:pickup-added' 
-              AND pickup_id = ? 
-              AND pickup_id_collected_by_player_id IS NULL 
-            ORDER BY id DESC LIMIT 1 FOR UPDATE
-        `, [roomId, pickupId]);
+        // 2. Locate and remove the pickup from the in-memory SpawnedItems Map
+        const roomItems = SpawnedItems.get(roomId);
+        if (!roomItems) {
+            throw new Error("Room items not found in memory");
+        }
 
-        if (!pickupRows.length) {
+        let collectedPickup = null;
+
+        if (roomItems instanceof Map) {
+            collectedPickup = roomItems.get(pickupId);
+            if (collectedPickup) {
+                roomItems.delete(pickupId);
+            }
+        } else if (Array.isArray(roomItems)) {
+            const index = roomItems.findIndex(p => String(p.pickup_id) === pickupId);
+            if (index !== -1) {
+                collectedPickup = roomItems[index];
+                roomItems.splice(index, 1);
+            }
+        } else if (typeof roomItems === 'object') {
+            collectedPickup = roomItems[pickupId];
+            if (collectedPickup) {
+                delete roomItems[pickupId];
+            }
+        }
+
+        if (!collectedPickup) {
             throw new Error("Pickup already collected or missing");
         }
 
-        const targetPickupRow = pickupRows[0];
-        let contents = null;
+        const contents = collectedPickup.contents || [];
 
-        try {
-            contents = JSON.parse(targetPickupRow.pick_up_contents);
-        } catch (parseErr) {
-            contents = targetPickupRow.pick_up_contents; 
-        }
-
-        // 🔥 Normalize bad legacy data payloads matching legacy fallback wrappers
-        if (typeof contents === 'string') {
-            contents = [{
-                type: "ITEM",
-                amount: 1,
-                item_id: contents
-            }];
-        }
-
-        if (contents && typeof contents === 'object' && !Array.isArray(contents) && contents.type) {
-            contents = [contents];
-        }
-
-        if (!Array.isArray(contents)) {
-            throw new Error("Invalid pickup contents format");
-        }
-
-        // 3. Flag requested map entity element status marker as claimed
-        await connection.execute(`
-            UPDATE event_queue 
-            SET pickup_id_collected_by_player_id = ? 
-            WHERE id = ?
-        `, [playerId, targetPickupRow.id]);
-
-        // 4. Disburse items/currencies loops
+        // 3. Disburse items/currencies to player in DB (Fully checks existing stack limits & rows)
         const results = [];
-        const exclude = [];
-
         for (const reward of contents) {
             if (reward.type === "ITEM") {
-                exclude.push(reward.item_id);
                 const itemResult = await grantItem(connection, playerId, reward.item_id, parseInt(reward.amount, 10));
                 results.push(itemResult);
             } else if (reward.type === "COIN") {
@@ -2420,14 +2729,65 @@ app.post('/session/collect-pickup', async (req, res) => {
             }
         }
 
-        // 5. Broadcast removal marker payload update message
+        // 4. Generate a brand new replacement pickup using your exact config rules
+        const currentPlacements = [];
+        if (roomItems instanceof Map) {
+            for (const item of roomItems.values()) {
+                if (item.placement) currentPlacements.push(item.placement.join(','));
+            }
+        } else if (Array.isArray(roomItems)) {
+            for (const item of roomItems) {
+                if (item.placement) currentPlacements.push(item.placement.join(','));
+            }
+        } else if (typeof roomItems === 'object') {
+            for (const item of Object.values(roomItems)) {
+                if (item.placement) currentPlacements.push(item.placement.join(','));
+            }
+        }
+
+        const availablePlacements = PICKUP_PLACEMENTS.filter(p => !currentPlacements.includes(p.join(',')));
+        const placementSource = availablePlacements.length > 0 ? availablePlacements : PICKUP_PLACEMENTS;
+        const chosenPlacement = placementSource[Math.floor(Math.random() * placementSource.length)];
+
+        const isCrate = Math.random() < PICKUPS_CONFIG.crate.probability;
+        const newPickupId = `${isCrate ? 'crate' : 'pickup'}_${Date.now()}_${Math.floor(Math.random() * 1000)}_${getRandomInt(100, 999)}`;
+        const newContents = [];
+
+        if (isCrate) {
+            const itemCount = getRandomInt(PICKUPS_CONFIG.crate.contains_min, PICKUPS_CONFIG.crate.contains_max);
+            const coins = getRandomInt(PICKUPS_CONFIG.crate.coins_min, PICKUPS_CONFIG.crate.coins_max);
+            
+            newContents.push({ type: "COIN", amount: coins });
+            for (let c = 0; c < itemCount; c++) {
+                const item = getWeightedRandom(PICKUPS_CONFIG.crate.contents);
+                newContents.push({ type: item.type, amount: item.amount, item_id: item.item_id, rarity: item.rarity });
+            }
+        } else {
+            const item = getWeightedRandom(PICKUPS_CONFIG.contents);
+            newContents.push({ type: item.type, amount: item.amount, item_id: item.item_id, rarity: item.rarity });
+        }
+
+        const newPickupPayload = {
+            pickup_id: String(newPickupId),
+            placement: [Number(chosenPlacement[0]), Number(chosenPlacement[1])],
+            contents: newContents
+        };
+
+        // 5. Insert the new replacement pickup directly into the SpawnedItems Map
+        if (roomItems instanceof Map) {
+            roomItems.set(newPickupId, newPickupPayload);
+        } else if (Array.isArray(roomItems)) {
+            roomItems.push(newPickupPayload);
+        } else if (typeof roomItems === 'object') {
+            roomItems[newPickupId] = newPickupPayload;
+        }
+
+        // 6. Broadcast removal and addition marker payloads update messages
         await publishLocalEvent(connection, roomId, "room:pickup-removed", {
             pickup_id: pickupId
         });
 
-        // 6. Automatically generate random replacement map asset point drops
-        const newPickupData = await makeNewPickup(connection, roomId, exclude);
-        await publishLocalEvent(connection, roomId, "room:pickup-added", newPickupData);
+        await publishLocalEvent(connection, roomId, "room:pickup-added", newPickupPayload);
 
         // Commit transaction atomic balance states across tables cleanly
         await connection.commit();
@@ -2438,20 +2798,18 @@ app.post('/session/collect-pickup', async (req, res) => {
         });
 
     } catch (transactionError) {
-        // Rollback engine states seamlessly to reverse half-executed modifications
         try {
             await connection.rollback();
         } catch (rollbackErr) {
             console.error("Rollback failed:", rollbackErr);
         }
 
-        console.error(">>> [PICKUP TRANSACTION EXCEPTION]:", transactionError.message);
+        console.error(">>> [COLLECT PICKUP EXCEPTION]:", transactionError.message);
         return res.status(500).json({
             error: "Server error",
             detail: transactionError.message
         });
     } finally {
-        // Always release connection wrapper instances back into the pool pipeline
         connection.release();
     }
 });
@@ -2556,8 +2914,14 @@ app.post('/event/check', async (req, res) => {
                     ticket_buy_in: parseInt(event.ticket_buy_in || 0, 10)
                 };
 
-                // Inject the event tracking array into the room event queue
-                await publishEvent(room_id, "shard:raid-boss-state-changed", payload, player_id);
+				const payloadStr = JSON.stringify(payload);
+				
+				// --- 2. IMMEDIATE REAL-TIME SSE EMIT ---
+                const sseSend = activeSseConnections.get(player_id);
+                if (sseSend) {
+                    sseSend("shard:raid-boss-state-changed", payloadStr);
+                }
+				
             }
         }
 
@@ -2722,10 +3086,6 @@ app.post('/shard/scores', async (req, res) => {
 });
 
 // -------------------- INITIATE WILD MORTY BATTLE (PvWM) --------------------
-// Helper functions (assuming defined in scope)
-const parseIdList = (str) => String(str || "").split(',').map(id => id.trim()).filter(Boolean);
-const toBool = (val) => val === true || val === 1 || String(val).toLowerCase() === 'true';
-
 app.post('/session/battle-wild-morty', async (req, res) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -2762,22 +3122,33 @@ app.post('/session/battle-wild-morty', async (req, res) => {
         if (!roomRows.length) {
             return res.status(409).json({ success: false, error: "Room does not exist", room_id: roomId });
         }
+		
+		// Get Morties ONLY from the player's current room
+        const roomMorties = SpawnedMorties.get(roomId) || [];
 
-        // 3. Extract the wild entity target instance from the event queue log map
-        const [wildRows] = await pool.execute(`
-            SELECT wild_morty_id, morty_id, placement, state, division, variant, shiny_if_potion 
-            FROM event_queue 
-            WHERE room_id = ? 
-              AND event_name = 'room:wild-morty-added' 
-              AND wild_morty_id = ? 
-            ORDER BY id DESC LIMIT 1
-        `, [roomId, wildMortyIdInput]);
+        const wildPayload = roomMorties.find(
+            m => String(m.wild_morty_id) === String(wildMortyIdInput)
+        );
 
-        if (!wildRows.length) {
-            return res.status(409).json({ success: false, error: "Morty does not exist" });
+        if (!wildPayload) {
+            console.log(
+                `[PvWM] Morty ${wildMortyIdInput} does not exist in room ${roomId}`
+            );
+
+            return res.status(409).json({
+                success: false,
+                error: "Morty does not exist in this room"
+            });
         }
 
-        const wildPayload = wildRows[0];
+        // Prevent battling an already-engaged Morty
+        if (wildPayload.state !== "WORLD") {
+            return res.status(409).json({
+                success: false,
+                error: "Morty is already in battle"
+            });
+        }
+
         const extractedMortyTemplateId = wildPayload.morty_id;
 
         // 4. Gather full target player information parameters
@@ -2815,32 +3186,49 @@ app.post('/session/battle-wild-morty', async (req, res) => {
             return res.status(400).json({ success: false, error: "Player has no owned Morties" });
         }
 
-        // Fallback: If no custom deck is set or found, use the first owned Morty as team baseline
         if (deckMortyIds.length === 0) {
             deckMortyIds = [ownedMortiesRows[0].owned_morty_id];
         }
 
         // Compile attack profiles map grouped by owned instances
         const attacksByOwnedMorty = {};
+
         const ownedMortyIds = ownedMortiesRows.map(m => m.owned_morty_id);
         const placeholders = ownedMortyIds.map(() => '?').join(',');
-        
+
         const [attackRows] = await pool.execute(`
-            SELECT owned_morty_id, attack_id, position, pp, pp_stat 
-            FROM owned_attacks 
-            WHERE owned_morty_id IN (${placeholders}) 
-            ORDER BY owned_morty_id ASC, position ASC
+            SELECT owned_morty_id, attacks_array
+            FROM owned_morties
+            WHERE owned_morty_id IN (${placeholders})
+            ORDER BY owned_morty_id ASC
         `, ownedMortyIds);
+
 
         for (const a of attackRows) {
             const oid = a.owned_morty_id;
-            if (!attacksByOwnedMorty[oid]) attacksByOwnedMorty[oid] = [];
-            attacksByOwnedMorty[oid].push({
-                attack_id: a.attack_id,
-                position: parseInt(a.position, 10),
-                pp: parseInt(a.pp, 10),
-                pp_stat: parseInt(a.pp_stat, 10)
-            });
+
+            attacksByOwnedMorty[oid] = [];
+
+            try {
+                let attacks = a.attacks_array || [];
+
+                // MySQL JSON columns may already be objects
+                if (typeof attacks === "string") {
+                    attacks = JSON.parse(attacks);
+                }
+
+                for (const attack of attacks) {
+                    attacksByOwnedMorty[oid].push({
+                        attack_id: String(attack.attack_id),
+                        position: parseInt(attack.position, 10),
+                        pp: parseInt(attack.pp, 10),
+                        pp_stat: parseInt(attack.pp_stat ?? attack.pp, 10)
+                    });
+                }
+
+            } catch (err) {
+                attacksByOwnedMorty[oid] = [];
+            }
         }
 
         // 7. Establish the lead living fighter index
@@ -2852,7 +3240,6 @@ app.post('/session/battle-wild-morty', async (req, res) => {
                 break;
             }
         }
-        // Last-resort fallback if everything is fainted, take first deck element
         if (!activeOwnedMorty && deckMortyIds.length > 0) {
             activeOwnedMorty = deckMortyIds[0];
         }
@@ -2890,7 +3277,6 @@ app.post('/session/battle-wild-morty', async (req, res) => {
             quantity: parseInt(it.quantity, 10)
         }));
 
-        // 10. Build complex structured payloads matching client mapping demands
         const moveLog = {
             cooldown: {},
             count: {},
@@ -2919,7 +3305,7 @@ app.post('/session/battle-wild-morty', async (req, res) => {
         };
 
         const wildOwnedPlayerId = crypto.randomUUID();
-        const opponentHP = 20; // Explicit structural logic assignment matches source
+        const opponentHP = 20;
 
         const opponentPayload = {
             player_id: wildOwnedPlayerId,
@@ -2940,29 +3326,11 @@ app.post('/session/battle-wild-morty', async (req, res) => {
             active_owned_morty: wildMortyIdInput
         };
 
-        // 11. Extract metadata and write state record into the battles engine tracker table
+        // 10. Store Battle State in Memory Map instead of MySQL INSERT
         const battleId = crypto.randomUUID();
-        const opponentActiveMortyId = opponentPayload.active_owned_morty;
-        const opponentMortyTemplateId = opponentPayload.owned_morties[0].morty_id;
-        const opponentHpValue = opponentPayload.owned_morties[0].hp;
-
-        const playerActiveMortyId = activeOwnedMorty;
         const matchedActiveMorty = ownedMortiesPayloadArray.find(m => m.owned_morty_id === activeOwnedMorty);
-        const playerHpValue = matchedActiveMorty ? matchedActiveMorty.hp : 0;
 
-        await pool.execute(`
-            INSERT INTO battles (
-                battle_id, player_id, opponent_id, wild_morty_id, 
-                opponent_active_morty, opponent_morty_id, opponent_hp, 
-                player_active_morty, player_hp, state, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', NOW())
-        `, [
-            battleId, playerId, wildOwnedPlayerId, extractedMortyTemplateId,
-            opponentActiveMortyId, opponentMortyTemplateId, opponentHpValue,
-            playerActiveMortyId, playerHpValue
-        ]);
-
-        // 12. Broadcast operational synchronization signals to SSE lines
+        // 11. Broadcast operational synchronization signals
         const finalBroadcastPayload = {
             battle_id: battleId,
             battle_type: "PvWM",
@@ -2971,9 +3339,23 @@ app.post('/session/battle-wild-morty', async (req, res) => {
             meta: {}
         };
         
-        await publishEvent(roomId, "battle:start", finalBroadcastPayload, playerId);
+        const payloadStr = JSON.stringify(finalBroadcastPayload);
+        const sseSend = activeSseConnections.get(playerId);
+        if (sseSend) {
+            sseSend("battle:start", payloadStr);
+        }
+		
+		Battles.set(finalBroadcastPayload);
+            
         await publishEvent(roomId, "room:wild-morty-state-changed", { wild_morty_id: wildMortyIdInput, state: "BATTLE" });
-        //await publishEvent(roomId, "room:user-state-changed", { player_id: playerId, state: "BATTLE" });
+
+        // Immediately lock it in memory
+        wildPayload.state = "BATTLE";
+        wildPayload._updated = new Date().toISOString();
+
+        SpawnedMorties.set(roomId, roomMorties);
+
+        //console.log(`[PvWM] ${wildMortyIdInput} locked as BATTLE in room ${roomId}`);
 
         return res.json({ success: true });
 
@@ -3032,7 +3414,7 @@ app.post('/session/battle/ready', async (req, res) => {
         };
 
         // 6. Broadcast the clock frame to kick off the client UI clock tracking 
-        await publishEvent(roomId, "battle:move-timer-started", battlePayload, playerId);
+        //await publishEvent(roomId, "battle:move-timer-started", battlePayload, playerId);
 
         return res.json({ success: true });
 
@@ -3052,14 +3434,16 @@ app.post('/session/battle/move', async (req, res) => {
     // ========================
     // INPUT VALIDATION
     // ========================
-    const sessionId    = req.body.session_id ? String(req.body.session_id) : "";
-    const battleId     = req.body.battle_id ? String(req.body.battle_id) : "";
-    const type         = req.body.type ? String(req.body.type) : "";
+    const sessionId = req.body.session_id ? String(req.body.session_id) : "";
+    const battleId = req.body.battle_id ? String(req.body.battle_id) : "";
+    const type = req.body.type ? String(req.body.type) : "";
     const ownedMortyId = req.body.owned_morty_id ? String(req.body.owned_morty_id) : "";
-    const moveId       = req.body.move_id ? String(req.body.move_id) : "";
+    const moveId = req.body.move_id ? String(req.body.move_id) : "";
 
     if (!sessionId || !battleId || !type) {
-        return res.status(400).json({ success: false });
+        return res.status(400).json({
+            success: false
+        });
     }
 
     try {
@@ -3067,186 +3451,328 @@ app.post('/session/battle/move', async (req, res) => {
         // PLAYER LOOKUP
         // ========================
         const [userRows] = await pool.execute(
-            "SELECT player_id, room_id FROM users WHERE session_id = ? LIMIT 1",
+            "SELECT player_id, username, player_avatar_id, level, room_id, active_deck_id FROM users WHERE session_id = ? LIMIT 1",
             [sessionId]
         );
         if (!userRows.length) {
-            return res.status(401).json({ success: false });
+            return res.status(401).json({
+                success: false
+            });
         }
 
         const playerId = userRows[0].player_id;
-        const roomId   = userRows[0].room_id;
+        const player_username = userRows[0].username;
+        const player_avatar_id = userRows[0].player_avatar_id;
+        const level = userRows[0].level;
+
+        const roomId = userRows[0].room_id;
+        const activeDeckId = userRows[0].active_deck_id;
+
+        //console.log(">>> Incoming battle_id from request:", battleId);
+        //console.log(">>> Current Battles keys in memory:", Array.from(Battles.keys()));
+        //console.log(">>> Current Battles values in memory:", Array.from(Battles.values()));
 
         // ========================
-        // GET BATTLE STATE
+        // RETRIEVE & VERIFY BATTLE
         // ========================
-        const [battleRows] = await pool.execute(
-            "SELECT * FROM battles WHERE battle_id = ? LIMIT 1",
-            [battleId]
-        );
-        if (!battleRows.length) {
-            return res.json({ success: false });
+        const targetBattleId = req.body.battle_id || req.params.battle_id || battleId;
+        let battle = null;
+
+        // 1. Direct get if targetBattleId is used as a key
+        if (targetBattleId && Battles.has(targetBattleId)) {
+            battle = Battles.get(targetBattleId);
         }
-        const battle = battleRows[0];
 
-        // ========================
-        // HELPERS
-        // ========================
-        const getAiMove = () => {
-            const moves = ["AttackBatteringRam", "AttackVileSpew"];
-            return moves[Math.floor(Math.random() * moves.length)];
-        };
+        // 2. Search values where the object itself has battle_id
+        if (!battle) {
+            battle = Array.from(Battles.values()).find(b => b && (b.battle_id === targetBattleId || b.battle_id === battleId));
+        }
 
-        // ========================
-        // TURN LOGIC ENGINE
-        // ========================
-        let outcome = "CONTINUE";
-        let turnDatas = [];
-        let xpDatas = [];
-
-        let playerHp = battle.player_hp !== undefined ? Number(battle.player_hp) : 0;
-        let enemyHp  = battle.opponent_hp !== undefined ? Number(battle.opponent_hp) : 0;
-
-        const aiMove = getAiMove();
-
-        // ------------------------
-        // CASE A: ITEM (CATCH)
-        // ------------------------
-        if (type === "ITEM" && moveId === "ItemMortyChip") {
-            const success = (Math.floor(Math.random() * 100) + 1) > 40;
-
-            const opponentId = battle.opponent_id;
-            const wildOwnedMortyId = battle.opponent_active_morty;
-            const wildMortyId = battle.wild_morty_id || "UnknownMorty";
-
-            // Optional item decrement query omitted matching your comment layout
-
-            // Retrieve updated item configuration
-            const [itemRows] = await pool.execute(
-                "SELECT quantity FROM owned_items WHERE player_id = ? AND item_id = 'ItemMortyChip'",
-                [playerId]
-            );
-            const remaining = itemRows.length ? Number(itemRows[0].quantity || 0) : 0;
-
-            turnDatas.push({
-                type: "ITEM",
-                attacker_player_id: playerId,
-                defender_player_id: opponentId,
-                item_id: "ItemMortyChip",
-                owned_morty_id: wildOwnedMortyId,
-                success: success
-            });
-
-            if (success) {
-                outcome = "CAUGHT";
-                const newOwnedMortyId = crypto.randomUUID();
-
-                const newMorty = {
-                    owned_morty_id: newOwnedMortyId,
-                    player_id: playerId,
-                    morty_id: wildMortyId,
-                    level: Math.floor(Math.random() * (50 - 30 + 1)) + 30,
-                    xp: Math.floor(Math.random() * (90000 - 50000 + 1)) + 50000,
-                    hp: Math.floor(Math.random() * (150 - 100 + 1)) + 100,
-                    hp_stat: Math.floor(Math.random() * (150 - 100 + 1)) + 100,
-                    attack_stat: Math.floor(Math.random() * (90 - 60 + 1)) + 60,
-                    defence_stat: Math.floor(Math.random() * (90 - 60 + 1)) + 60,
-                    speed_stat: Math.floor(Math.random() * (90 - 60 + 1)) + 60,
-                    variant: "Normal",
-                    owned_attacks: [
-                        { attack_id: "AttackFanArt", pp: 5, position: 0 },
-                        { attack_id: "AttackWetTongue", pp: 5, position: 1 },
-                        { attack_id: "AttackScratchAndSniff", pp: 5, position: 2 },
-                        { attack_id: "AttackLick", pp: 18, position: 3 }
-                    ]
-                };
-
-                await publishEvent(roomId, "battle:turn-result", {
-                    battle_id: battleId,
-                    outcome: "CAUGHT",
-                    turn_datas: turnDatas,
-                    player_datas: {
-                        player: {
-                            owned_items: [
-                                { item_id: "ItemMortyChip", quantity: remaining }
-                            ],
-                            rewards: [
-                                {
-                                    type: "MORTY",
-                                    morty_id: wildMortyId,
-                                    level: newMorty.level,
-                                    added_to_active_deck: true,
-                                    owned_morty_limit_reached: false,
-                                    variant: "Normal",
-                                    owned_morty: newMorty
-                                }
-                            ],
-                            attacks_to_learn: [],
-                            move_log: {
-                                cooldown: { ATTACK: 0, ITEM: 1 },
-                                count: { ATTACK: 1, ITEM: 1 },
-                                cooldown_next: { ITEM: 2 },
-                                last_move_type: "ITEM"
-                            }
-                        },
-                        opponent: {}
-                    }
-                }, playerId);
-
-                // Side effects run sequentially at block terminal boundary
+        // 3. Search keys if keys are objects containing battle_id
+        if (!battle) {
+            for (const key of Battles.keys()) {
+                if (key && typeof key === 'object' && (key.battle_id === targetBattleId || key.battle_id === battleId)) {
+                    battle = Battles.get(key) || key;
+                    break;
+                }
             }
         }
 
-        // ------------------------
-        // CASE B: ATTACK ACTION
-        // ------------------------
-        if (type === "ATTACK") {
-            const playerDamage = 20; // Fixed rand(20, 20)
-            const aiDamage     = Math.floor(Math.random() * (3 - 1 + 1)) + 1;
-
-            const enemyHpAfter  = Math.max(enemyHp - playerDamage, 0);
-            const playerHpAfter = Math.max(playerHp - aiDamage, 0);
-
-            // Step 1: Push Player Turn Event Sequence
-            turnDatas.push({
-                type: "ATTACK",
-                attacker_player_id: playerId,
-                defender_player_id: battle.opponent_id,
-                attack_id: moveId,
-                element_modifier: 1,
-                effect_datas: [{
-                    type: "Hit",
-                    is_accurate: true,
-                    to_self: false,
-                    continue_on_miss: false,
-                    is_critical: false,
-                    damage: playerDamage,
-                    defender_morty_datas: [{
-                        owned_morty_id: battle.opponent_active_morty,
-                        hp: enemyHpAfter
-                    }]
-                }],
-                attacker_morty_datas: [{
-                    owned_morty_id: ownedMortyId,
-                    owned_attacks: [{
-                        attack_id: moveId,
-                        pp: Math.floor(Math.random() * 5) + 1
-                    }]
-                }]
+        if (battle) {
+            //console.log(">>> [BATTLE FOUND SUCCESSFULLY]:");
+            //console.log("Player owned_morties:", JSON.stringify(battle.player?.owned_morties, null, 2));
+            //console.log("Player owned_items:", JSON.stringify(battle.player?.owned_items, null, 2));
+            //console.log("Opponent owned_morties:", JSON.stringify(battle.opponent?.owned_morties, null, 2));
+        } else {
+            //console.log(">>> Battle not found in memory!");
+            return res.status(404).json({
+                success: false,
+                error: "Battle not found"
             });
+        }
 
-            enemyHp = enemyHpAfter;
+        // Security check: Verify the authenticated player owns this active battle
+        const battlePlayerId = battle.player_id || (battle.player && battle.player.player_id);
+        if (battlePlayerId && battlePlayerId !== playerId) {
+            return res.status(403).json({
+                success: false,
+                error: "Unauthorized battle access"
+            });
+        }
 
-            // Step 2: Validate Target State Prior to Counteraction
-            if (enemyHp > 0) {
+        // Optional check: Ensure the battle is still active
+        if (battle.state && battle.state !== "ACTIVE") {
+            return res.status(400).json({
+                success: false,
+                error: "Battle is no longer active"
+            });
+        }
+
+        if (battle.battle_type == "PvWM") {
+            // ========================
+            // HELPERS
+            // ========================
+            const getAiMove = () => {
+                const moves = ["AttackBatteringRam", "AttackVileSpew"];
+                return moves[Math.floor(Math.random() * moves.length)];
+            };
+
+            // ========================
+            // TURN LOGIC ENGINE
+            // ========================
+            let outcome = "CONTINUE";
+            let turnDatas = [];
+            let xpDatas = [];
+
+            const aiMove = getAiMove();
+
+            const opponentId = battle.opponent?.player_id;
+            const wildOwnedMortyId = battle.opponent?.owned_morties?.[0]?.owned_morty_id;
+            const wildMortyId = battle.opponent?.owned_morties?.[0]?.morty_id;
+
+            let playerHp = battle.player?.owned_morties?.[0]?.hp;
+            let enemyHp = battle.opponent?.owned_morties?.[0]?.hp;
+			
+			
+			// Get Morties ONLY from the player's current room
+			const roomMorties = SpawnedMorties.get(roomId) || [];
+
+			const wildPayload = roomMorties.find(
+                m => String(m.wild_morty_id) === String(wildOwnedMortyId)
+			);
+
+			if (!wildPayload) {
+				console.log(`[PvWM] Morty ${wildOwnedMortyId} does not exist in room ${roomId}`);
+                return res.status(409).json({success: false,error: "Morty does not exist in this room"});
+            }
+
+            //console.log(">>> Opponent Player ID:", opponentId);
+            //console.log(">>> Opponent Owned Morty ID:", wildOwnedMortyId);
+            //console.log(">>> Wild Morty ID:", wildMortyId);
+
+            // ------------------------
+            // CASE A: ITEM (CATCH)
+            // ------------------------
+            if (type === "ITEM" && moveId === "ItemMortyChip") {
+                const success = (Math.floor(Math.random() * 100) + 1) <= 50;
+
+                // Retrieve updated item configuration
+                const [itemRows] = await pool.execute(
+                    "SELECT item_id, quantity FROM owned_items WHERE player_id = ?",
+                    [playerId]
+                );
+
+                const ownedItems = itemRows.map(row => {
+                    let qty = Number(row.quantity || 0);
+                    if (row.item_id === moveId) {
+                        qty = Math.max(0, qty - 1);
+                    }
+                    return {
+                        item_id: row.item_id,
+                        quantity: qty
+                    };
+                });
+
                 turnDatas.push({
-                    type: "ATTACK",
-                    attacker_player_id: battle.opponent_id,
-                    defender_player_id: playerId,
-                    attack_id: aiMove,
-                    element_modifier: 1,
-                    effect_datas: [
-                        {
+                    type: "ITEM",
+                    attacker_player_id: playerId,
+                    defender_player_id: opponentId,
+                    item_id: moveId,
+                    owned_morty_id: wildOwnedMortyId,
+                    success: success
+                });
+
+                if (success) {
+				    const key = String(roomId);
+				    let roomMorties = SpawnedMorties.get(key) || [];
+
+				    // 1. Remove the old wild Morty from memory
+				    if (Array.isArray(roomMorties)) {
+                        roomMorties = roomMorties.filter(m => m.wild_morty_id !== wildOwnedMortyId);
+				    }
+
+				    // 2. Determine non-overlapping placements
+				    const currentPlacements = roomMorties.map(m => m.placement ? m.placement.join(',') : '');
+				    const availablePlacements = WILD_MORTY_PLACEMENTS.filter(
+                        p => !currentPlacements.includes(p.join(','))
+				    );
+				    const placementSource = availablePlacements.length > 0 ? availablePlacements : WILD_MORTY_PLACEMENTS;
+				    const chosenPlacement = placementSource[Math.floor(Math.random() * placementSource.length)];
+
+				    // 3. Construct new wild Morty payload
+				    const selectedMorty = getWeightedRandom(WILD_MORTIES_CONFIG.morties, 0);
+				    const safeDate = new Date().toISOString();
+				    const newWildMortyId = `wild_morty_${Date.now()}_${getRandomInt(100, 999)}`;
+
+				    const newWildMorty = {
+                        morty_id: String(selectedMorty.morty_id),
+                        placement: [Number(chosenPlacement[0]), Number(chosenPlacement[1])],
+                        state: "WORLD",
+                        division: getRandomInt(1, 4),
+                        variant: "Normal",
+                        shiny_if_potion: Math.random() < 0.2,
+                        _created: safeDate,
+                        _updated: safeDate,
+                        wild_morty_id: String(newWildMortyId)
+                    };
+
+                    // 4. Update SpawnedMorties Map
+                    roomMorties.push(newWildMorty);
+                    SpawnedMorties.set(key, roomMorties);
+
+                    // 5. Broadcast despawn & spawn events to the room
+                    await publishEvent(roomId, "room:wild-morty-removed", { wild_morty_id: wildOwnedMortyId });
+                    await publishEvent(roomId, "room:wild-morty-added", { wild_morty: newWildMorty });
+
+                    outcome = "CAUGHT";
+                    const newOwnedMortyId = crypto.randomUUID();
+
+                    const newMorty = {
+                        owned_morty_id: newOwnedMortyId,
+                        player_id: playerId,
+                        morty_id: wildMortyId,
+                        level: 5,
+                        xp: 250,
+                        hp: 20,
+                        hp_stat: 20,
+                        attack_stat: 80,
+                        defence_stat: 50,
+                        speed_stat: 20,
+                        variant: "Normal",
+                        owned_attacks: [{
+                                attack_id: "AttackFanArt",
+                                pp: 5,
+                                position: 0
+                            },
+                            {
+                                attack_id: "AttackWetTongue",
+                                pp: 5,
+                                position: 1
+                            },
+                            {
+                                attack_id: "AttackScratchAndSniff",
+                                pp: 5,
+                                position: 2
+                            },
+                            {
+                                attack_id: "AttackLick",
+                                pp: 18,
+                                position: 3
+                            }
+                        ]
+                    };
+
+                    // Insert the caught Morty into your database table
+                    await pool.execute(`INSERT INTO owned_morties (player_id, owned_morty_id, morty_id, level, xp, hp, hp_stat, attack_stat, defence_stat, speed_stat, variant, attacks_array) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [playerId, newMorty.owned_morty_id, newMorty.morty_id, newMorty.level, newMorty.xp, newMorty.hp, newMorty.hp_stat, newMorty.attack_stat, newMorty.defence_stat, newMorty.speed_stat, newMorty.variant, newMorty.owned_attacks]);
+
+                    const [deckRows] = await pool.execute(`SELECT owned_morty_ids FROM decks WHERE player_id = ? AND deck_id = ?`, [playerId, activeDeckId]);
+
+                    let activeDeckArray = [];
+                    if (deckRows.length && deckRows[0].owned_morty_ids) {
+                        try {
+                            activeDeckArray = typeof deckRows[0].owned_morty_ids === 'string' ?
+                                JSON.parse(deckRows[0].owned_morty_ids) :
+                                deckRows[0].owned_morty_ids;
+                        } catch (e) {
+                            activeDeckArray = [];
+                        }
+                    }
+
+                    const currentOwnedCount = Array.isArray(activeDeckArray) ? activeDeckArray.length : 0;
+                    const MAX_DECK_LIMIT = 5;
+                    const isDeckFull = currentOwnedCount >= MAX_DECK_LIMIT;
+
+                    // 1. Push the new owned morty ID into the array if the deck is not full
+                    if (!isDeckFull) {
+                        activeDeckArray.push(newOwnedMortyId);
+
+                        // 2. Update the decks table with the new JSON string array
+                        await pool.execute(`UPDATE decks SET owned_morty_ids = ? WHERE player_id = ? AND deck_id = ?`, [JSON.stringify(activeDeckArray), playerId, activeDeckId]);
+
+                        await publishEvent(roomId, "room:user-modified", {
+                            player_id: playerId,
+                            username: player_username,
+                            player_avatar_id: player_avatar_id,
+                            level: level,
+                            owned_morties: activeDeckArray,
+                            state: "WORLD"
+                        }, playerId);
+
+
+                    }
+
+                    await publishEvent(roomId, "battle:turn-result", {
+                        battle_id: battleId,
+                        outcome: "CAUGHT",
+                        turn_datas: turnDatas,
+                        player_datas: {
+                            player: {
+                                owned_items: ownedItems,
+                                rewards: [{
+                                    type: "MORTY",
+                                    morty_id: wildMortyId,
+                                    level: newMorty.level,
+                                    added_to_active_deck: !isDeckFull,
+                                    owned_morty_limit_reached: false,
+                                    variant: "Normal",
+                                    owned_morty: newMorty
+                                }],
+                                attacks_to_learn: [],
+                                move_log: {
+                                    cooldown: {
+                                        ATTACK: 0,
+                                        ITEM: 1
+                                    },
+                                    count: {
+                                        ATTACK: 1,
+                                        ITEM: 1
+                                    },
+                                    cooldown_next: {
+                                        ITEM: 2
+                                    },
+                                    last_move_type: "ITEM"
+                                }
+                            },
+                            opponent: {}
+                        }
+                    }, playerId);
+
+                    // Side effects run sequentially at block terminal boundary
+                } else {
+
+                    const playerDamage = 20; // Fixed rand(20, 20)
+                    const aiDamage = Math.floor(Math.random() * (3 - 1 + 1)) + 1;
+
+                    const enemyHpAfter = Math.max(enemyHp - playerDamage, 0);
+                    const playerHpAfter = Math.max(playerHp - aiDamage, 0);
+
+                    turnDatas.push({
+                        type: "ATTACK",
+                        attacker_player_id: opponentId,
+                        defender_player_id: playerId,
+                        attack_id: aiMove,
+                        element_modifier: 1,
+                        effect_datas: [{
                             type: "Hit",
                             is_accurate: true,
                             to_self: false,
@@ -3257,130 +3783,22 @@ app.post('/session/battle/move', async (req, res) => {
                                 owned_morty_id: ownedMortyId,
                                 hp: playerHpAfter
                             }]
-                        }
-                    ],
-                    attacker_morty_datas: [{
-                        owned_morty_id: battle.opponent_active_morty,
-                        owned_attacks: [{
-                            attack_id: aiMove,
-                            pp: 1
+                        }],
+                        attacker_morty_datas: [{
+                            owned_morty_id: wildOwnedMortyId,
+                            owned_attacks: [{
+                                attack_id: aiMove,
+                                pp: 1
+                            }]
                         }]
-                    }]
-                });
+                    });
 
-                playerHp = playerHpAfter;
-                if (playerHp <= 0) {
-                    outcome = "LOSE";
-                }
-            } else {
-                // Enemy eliminated -> Process Victory Calculation
-                outcome = "WIN";
-                const xpEarned = 10;
-                const currentXpEarned = 100;
-                const updateTotalXp = currentXpEarned + xpEarned;
-                const xpLower = 100;
-                const updateXpLower = xpLower + xpEarned;
-
-                xpDatas = [{
-                    owned_morty_id: ownedMortyId,
-                    xp_earned: xpEarned,
-                    owned_morty_datas: [{
-                        level: 5,
-                        xp: updateTotalXp,
-                        hp: 20,
-                        hp_stat: 20,
-                        attack_stat: 11,
-                        defence_stat: 10,
-                        speed_stat: 10,
-                        variant: "Normal",
-                        xp_lower: updateXpLower,
-                        xp_upper: 225
-                    }]
-                }];
-            }
-        }
-
-        // ========================
-        // COMMIT STATE TO STORAGE
-        // ========================
-        await pool.execute(
-            "UPDATE battles SET player_hp = ?, opponent_hp = ? WHERE battle_id = ?",
-            [playerHp, enemyHp, battleId]
-        );
-
-        // ========================
-        // CONDITIONAL EMISSION PIPELINE
-        // ========================
-        if (type === "RUN") {
-            const wildMortyId = battle.opponent_active_morty;
-            await publishEvent(roomId, "room:wild-morty-state-changed", { wild_morty_id: wildMortyId, state: "WORLD" });
-            await publishEvent(roomId, "room:user-state-changed", { player_id: playerId, state: "WORLD" });
-            
-            await publishEvent(roomId, "battle:turn-result", {
-                battle_id: battleId,
-                outcome: "RUN",
-                turn_datas: turnDatas,
-                player_datas: {
-                    player: {
-                        attacks_to_learn: [],
-                        move_log: {
-                            cooldown: { ATTACK: 0, RUN: 0 },
-                            count: { ATTACK: turnDatas.length, RUN: 1 },
-                            cooldown_next: { ITEM: 1 },
-                            last_move_type: type
-                        }
-                    },
-                    opponent: {}
-                },
-                battle_abandoned: true
-            }, playerId);
-
-        } else {
-            if (outcome === "WIN") {
-                const wildMortyId = battle.opponent_active_morty;
-                await publishEvent(roomId, "room:wild-morty-state-changed", { wild_morty_id: wildMortyId, state: "WORLD" });
-                await publishEvent(roomId, "room:user-state-changed", { player_id: playerId, state: "WORLD" });
-
-                await publishEvent(roomId, "battle:turn-result", {
-                    battle_id: battleId,
-                    outcome: "WIN",
-                    turn_datas: turnDatas,
-                    player_datas: {
-                        player: {
-							"player_xp_datas":{
-							"streak":1,"streak_old":0,"xp_earned":50,"xp_multiplier":1,
-							"player_datas":[
-							    {
-								    "level":1,
-								    "xp":50,
-								    "xp_lower":27,
-								    "xp_upper":64
-							    }
-							]},
-                            xp_datas: xpDatas,
-                            rewards: [
-                                {
-                                    type: "ITEM",
-                                    item_id: "ItemCircuitBoard",
-                                    quantity: 10,
-                                    amount_received: 0,
-                                    amount: 1
-                                }
-                            ],
-                            attacks_to_learn: [],
-                            move_log: {
-                                cooldown: { ATTACK: 0 },
-                                count: { ATTACK: turnDatas.length },
-                                cooldown_next: { ITEM: 1 },
-                                last_move_type: type
-                            },
-                        },
-                        opponent: {}
+                    playerHp = playerHpAfter;
+                    if (playerHp <= 0) {
+                        outcome = "LOSE";
                     }
-                }, playerId);
-			
+                }
 
-            } else if (outcome !== "CAUGHT") {
                 // Evaluates for standard CONTINUE status updates
                 await publishEvent(roomId, "battle:turn-result", {
                     battle_id: battleId,
@@ -3388,36 +3806,334 @@ app.post('/session/battle/move', async (req, res) => {
                     turn_datas: turnDatas,
                     player_datas: {
                         player: {
+                            owned_items: ownedItems,
                             move_log: {
-                                cooldown: { ATTACK: 0 },
-                                count: { ATTACK: turnDatas.length },
-                                cooldown_next: { ITEM: 1 },
+                                cooldown: {
+                                    ATTACK: 0
+                                },
+                                count: {
+                                    ATTACK: turnDatas.length
+                                },
+                                cooldown_next: {
+                                    ITEM: 1
+                                },
                                 last_move_type: type
                             }
                         },
                         opponent: {}
                     }
                 }, playerId);
-            }
-        }
 
-        // Post-Turn Cleanups for absolute resolution shifts (Lose / Caught)
-        if (outcome === "LOSE" || outcome === "CAUGHT") {
-            const wildMortyId = battle.opponent_active_morty;
-            await publishEvent(roomId, "room:wild-morty-state-changed", { wild_morty_id: wildMortyId, state: "WORLD" });
-            await publishEvent(roomId, "room:user-state-changed", { player_id: playerId, state: "WORLD" });
-        }
+
+            }
+
+            // ------------------------
+            // CASE B: ATTACK ACTION
+            // ------------------------
+            if (type === "ATTACK") {
+                const playerDamage = 20; // Fixed rand(20, 20)
+                const aiDamage = Math.floor(Math.random() * (3 - 1 + 1)) + 1;
+
+                const enemyHpAfter = Math.max(enemyHp - playerDamage, 0);
+                const playerHpAfter = Math.max(playerHp - aiDamage, 0);
+
+                // Step 1: Push Player Turn Event Sequence
+                turnDatas.push({
+                    type: "ATTACK",
+                    attacker_player_id: playerId,
+                    defender_player_id: opponentId,
+                    attack_id: moveId,
+                    element_modifier: 1,
+                    effect_datas: [{
+                        type: "Hit",
+                        is_accurate: true,
+                        to_self: false,
+                        continue_on_miss: false,
+                        is_critical: false,
+                        damage: playerDamage,
+                        defender_morty_datas: [{
+                            owned_morty_id: wildOwnedMortyId,
+                            hp: enemyHpAfter
+                        }]
+                    }],
+                    attacker_morty_datas: [{
+                        owned_morty_id: ownedMortyId,
+                        owned_attacks: [{
+                            attack_id: moveId,
+                            pp: Math.floor(Math.random() * 5) + 1
+                        }]
+                    }]
+                });
+
+                enemyHp = enemyHpAfter;
+
+                // Step 2: Validate Target State Prior to Counteraction
+                if (enemyHp > 0) {
+                    turnDatas.push({
+                        type: "ATTACK",
+                        attacker_player_id: opponentId,
+                        defender_player_id: playerId,
+                        attack_id: aiMove,
+                        element_modifier: 1,
+                        effect_datas: [{
+                            type: "Hit",
+                            is_accurate: true,
+                            to_self: false,
+                            continue_on_miss: false,
+                            is_critical: false,
+                            damage: aiDamage,
+                            defender_morty_datas: [{
+                                owned_morty_id: ownedMortyId,
+                                hp: playerHpAfter
+                            }]
+                        }],
+                        attacker_morty_datas: [{
+                            owned_morty_id: wildOwnedMortyId,
+                            owned_attacks: [{
+                                attack_id: aiMove,
+                                pp: 1
+                            }]
+                        }]
+                    });
+
+                    playerHp = playerHpAfter;
+                    if (playerHp <= 0) {
+                        outcome = "LOSE";
+                    }
+
+                    await publishEvent(roomId, "battle:turn-result", {
+                        battle_id: battleId,
+                        outcome: outcome,
+                        turn_datas: turnDatas,
+                        player_datas: {
+                            player: {
+                                attacks_to_learn: [],
+                                move_log: {
+                                    cooldown: {
+                                        ATTACK: 0,
+                                        RUN: 0
+                                    },
+                                    count: {
+                                        ATTACK: turnDatas.length,
+                                        RUN: 1
+                                    },
+                                    cooldown_next: {
+                                        ITEM: 1
+                                    },
+                                    last_move_type: type
+                                }
+                            },
+                            opponent: {}
+                        },
+                        battle_abandoned: true
+                    }, playerId);
+
+                } else {
+                    // Enemy eliminated -> Process Victory Calculation
+                    outcome = "WIN";
+                    const currentXpEarned = 0;
+                    const xpEarned = 0;
+                    const updateTotalXp = currentXpEarned + xpEarned;
+
+                    xpDatas = [{
+                        owned_morty_id: ownedMortyId,
+                        xp_earned: 220,
+                        owned_morty_datas: [{
+                            level: 5,
+                            xp: 210,
+                            hp: playerHp,
+                            hp_stat: 20,
+                            attack_stat: 11,
+                            defence_stat: 10,
+                            speed_stat: 10,
+                            variant: "Normal",
+                            xp_lower: 0,
+                            xp_upper: 220
+                        }]
+                    }];
+                }
+            }
+
+            // ========================
+            // COMMIT STATE TO STORAGE
+            // ========================
+            // Update in-memory map state for PvWM
+            battle.player.owned_morties[0].hp = playerHp;
+            battle.opponent.owned_morties[0].hp = enemyHp;
+
+            // ========================
+            // CONDITIONAL EMISSION PIPELINE
+            // ========================
+            if (type === "RUN") {
+                // Immediately lock it in memory
+                wildPayload.state = "WORLD";
+                wildPayload._updated = new Date().toISOString();
+				
+                await publishEvent(roomId, "battle:turn-result", {
+                    battle_id: battleId,
+                    outcome: "RUN",
+                    turn_datas: turnDatas,
+                    player_datas: {
+                        player: {
+                            attacks_to_learn: [],
+                            move_log: {
+                                cooldown: {
+                                    ATTACK: 0,
+                                    RUN: 0
+                                },
+                                count: {
+                                    ATTACK: turnDatas.length,
+                                    RUN: 1
+                                },
+                                cooldown_next: {
+                                    ITEM: 1
+                                },
+                                last_move_type: type
+                            }
+                        },
+                        opponent: {}
+                    },
+                    battle_abandoned: true
+                }, playerId);
+				
+				await publishEvent(roomId, "room:wild-morty-state-changed", {
+                    wild_morty_id: wildOwnedMortyId,
+                    state: "WORLD"
+                });
+                await publishEvent(roomId, "room:user-state-changed", {
+                    player_id: playerId,
+                    state: "WORLD"
+                });
+
+            }
+
+
+            if (outcome === "WIN") {
+                await publishEvent(roomId, "battle:turn-result", {
+                    battle_id: battleId,
+                    outcome: "WIN",
+                    turn_datas: turnDatas,
+                    player_datas: {
+                        player: {
+                            "player_xp_datas": {
+                                "streak": 0,
+                                "streak_old": 0,
+                                "xp_earned": 60,
+                                "xp_multiplier": 0,
+                                "player_datas": [{
+                                    "level": 1,
+                                    "xp": 60,
+                                    "xp_lower": 0,
+                                    "xp_upper": 64
+                                }]
+                            },
+                            xp_datas: xpDatas,
+                            rewards: [{
+                                type: "ITEM",
+                                item_id: "ItemCircuitBoard",
+                                quantity: 10,
+                                amount_received: 0,
+                                amount: 1
+                            }],
+                            attacks_to_learn: [],
+                            move_log: {
+                                cooldown: {
+                                    ATTACK: 0
+                                },
+                                count: {
+                                    ATTACK: turnDatas.length
+                                },
+                                cooldown_next: {
+                                    ITEM: 1
+                                },
+                                last_move_type: type
+                            },
+                        },
+                        opponent: {}
+                    }
+                }, playerId);
+
+				const key = String(roomId);
+                let roomMorties = SpawnedMorties.get(key) || [];
+
+                // 1. Remove the old wild Morty from memory
+                if (Array.isArray(roomMorties)) {
+                    roomMorties = roomMorties.filter(m => m.wild_morty_id !== wildOwnedMortyId);
+                }
+
+                // 2. Determine non-overlapping placements
+                const currentPlacements = roomMorties.map(m => m.placement ? m.placement.join(',') : '');
+                const availablePlacements = WILD_MORTY_PLACEMENTS.filter(
+                    p => !currentPlacements.includes(p.join(','))
+                );
+                const placementSource = availablePlacements.length > 0 ? availablePlacements : WILD_MORTY_PLACEMENTS;
+                const chosenPlacement = placementSource[Math.floor(Math.random() * placementSource.length)];
+
+                // 3. Construct new wild Morty payload
+                const selectedMorty = getWeightedRandom(WILD_MORTIES_CONFIG.morties, 0);
+                const safeDate = new Date().toISOString();
+                const newWildMortyId = `wild_morty_${Date.now()}_${getRandomInt(100, 999)}`;
+
+                const newWildMorty = {
+                    morty_id: String(selectedMorty.morty_id),
+                    placement: [Number(chosenPlacement[0]), Number(chosenPlacement[1])],
+                    state: "WORLD",
+                    division: getRandomInt(1, 4),
+                    variant: "Normal",
+                    shiny_if_potion: Math.random() < 0.2,
+                    _created: safeDate,
+                    _updated: safeDate,
+                    wild_morty_id: String(newWildMortyId)
+                };
+
+                // 4. Update SpawnedMorties Map
+                roomMorties.push(newWildMorty);
+                SpawnedMorties.set(key, roomMorties);
+
+                // 5. Broadcast despawn & spawn events to the room
+                await publishEvent(roomId, "room:wild-morty-removed", { 
+                    wild_morty_id: wildOwnedMortyId 
+                });
+
+                await publishEvent(roomId, "room:wild-morty-added", { wild_morty: newWildMorty });
+                await publishEvent(roomId, "room:user-state-changed", { player_id: playerId, state: "WORLD" });
+            }
+
+            // Post-Turn Cleanups for absolute resolution shifts (Lose / Caught)
+            if (outcome === "LOSE") {
+                // Immediately lock it in memory
+                wildPayload.state = "WORLD";
+                wildPayload._updated = new Date().toISOString();
+				
+                await publishEvent(roomId, "room:wild-morty-state-changed", {
+                    wild_morty_id: wildOwnedMortyId,
+                    state: "WORLD"
+                });
+                await publishEvent(roomId, "room:user-state-changed", {
+                    player_id: playerId,
+                    state: "WORLD"
+                });
+            }
+			
+			Battles.delete(battleId);
+        } // end of PvWM battle
 
         // ========================
         // FINAL COMPONENT RESPONSE
         // ========================
-        return res.json({ success: true });
+        return res.json({
+            success: true
+        });
 
     } catch (err) {
         console.error(">>> [CRITICAL REEVALUATION ROUTE FAILURE]:", err);
-        return res.status(500).json({ success: false });
+        return res.status(500).json({
+            success: false
+        });
     }
 });
+
+
 
 // ============================================================================
 // 🗺️ ROUTE: GET ROOM DETAILS & SYNCHRONIZE OVERWORLD ENTITIES
@@ -3454,6 +4170,7 @@ app.post('/session/room-details', async (req, res) => {
             return res.json({ error: "Invalid session" });
         }
 
+        const playerId = selfRows[0].player_id;
         const roomId = selfRows[0].room_id;
 
         // --------------------------------------------------------------------
@@ -3474,7 +4191,7 @@ app.post('/session/room-details', async (req, res) => {
         // 3. USERS (Real Players with Flattened Bulk Asset Fetching)
         // --------------------------------------------------------------------
         const [activeUsers] = await pool.execute(`
-            SELECT player_id, username, player_avatar_id, level, active_deck_id, state 
+            SELECT player_id, username, player_avatar_id, level, active_deck_id, state, streak 
             FROM users 
             WHERE room_id = ? 
               AND last_seen >= (NOW() - INTERVAL 5 MINUTE)
@@ -3483,50 +4200,57 @@ app.post('/session/room-details', async (req, res) => {
         const usersPayload = [];
 
         if (activeUsers.length > 0) {
+            // 1. Get all unique player_ids to bulk fetch their active decks
             const playerIds = activeUsers.map(u => u.player_id);
-            const activeDeckIds = activeUsers.map(u => u.active_deck_id).filter(id => id && id !== '0');
+            const playerPlaceholders = playerIds.map(() => '?').join(',');
 
-            // Fetch Decks matching player deck targets in bulk
-            let deckMap = {};
-            if (activeDeckIds.length > 0) {
-                const deckPlaceholders = activeDeckIds.map(() => '?').join(',');
-                const [decks] = await pool.execute(`
-                    SELECT player_id, deck_id, owned_morty_ids 
-                    FROM decks 
-                    WHERE deck_id IN (${deckPlaceholders})
-                `, activeDeckIds);
+            // Fetch decks for these players
+            const [decks] = await pool.execute(`
+                SELECT player_id, deck_id, owned_morty_ids 
+                FROM decks 
+                WHERE player_id IN (${playerPlaceholders})
+            `, playerIds);
 
-                for (const d of decks) {
-                    deckMap[`${d.player_id}_${d.deck_id}`] = d.owned_morty_ids;
-                }
+            // Map deck list by `${player_id}_${deck_id}`
+            const deckMap = {};
+            for (const d of decks) {
+                // Handle numerical 0 deck_id safely by converting to String
+                const deckKey = `${d.player_id}_${String(d.deck_id)}`;
+                deckMap[deckKey] = d.owned_morty_ids;
             }
 
-            // Gather all requested Morty IDs across all active player sets to run a single optimized bulk query
+            // 2. Extract owned_morty_ids for each player's active deck
             let allTargetMortyIds = [];
             const userDeckAssignments = activeUsers.map(u => {
-                const lookupKey = `${u.player_id}_${u.active_deck_id}`;
+                // active_deck_id can be 0, so convert explicitly to String
+                const targetDeckId = u.active_deck_id !== null && u.active_deck_id !== undefined ? String(u.active_deck_id) : "0";
+                const lookupKey = `${u.player_id}_${targetDeckId}`;
                 const rawMortyIds = deckMap[lookupKey];
+
                 let parsedIds = [];
                 if (rawMortyIds) {
                     try {
-                        // Support both raw comma strings or JSON array fallbacks
-                        parsedIds = typeof rawMortyIds === 'string' && rawMortyIds.startsWith('[')
+                        // Handle JSON array format OR comma-separated string
+                        parsedIds = typeof rawMortyIds === 'string' && rawMortyIds.trim().startsWith('[')
                             ? JSON.parse(rawMortyIds)
                             : String(rawMortyIds).split(',').map(id => id.trim()).filter(Boolean);
+
+                        parsedIds = parsedIds.map(id => String(id));
                     } catch (e) {
                         parsedIds = [];
                     }
                 }
+
                 allTargetMortyIds = allTargetMortyIds.concat(parsedIds);
-                return { user: u, deckIds: parsedIds };
+                return { user: u, mortyIds: parsedIds };
             });
 
-            // Perform bulk query for morties if target items exist
+            // 3. Bulk fetch Morties from owned_morties by owned_morty_id
             let mortiesGlobalMap = {};
             if (allTargetMortyIds.length > 0) {
                 const uniqueMortyIds = [...new Set(allTargetMortyIds)];
                 const mortyPlaceholders = uniqueMortyIds.map(() => '?').join(',');
-                
+
                 const [mortyRows] = await pool.execute(`
                     SELECT player_id, owned_morty_id, morty_id, hp, variant, is_locked, is_trading_locked, fight_pit_id 
                     FROM owned_morties 
@@ -3534,19 +4258,19 @@ app.post('/session/room-details', async (req, res) => {
                 `, uniqueMortyIds);
 
                 for (const m of mortyRows) {
-                    mortiesGlobalMap[m.owned_morty_id] = m;
+                    // Key by player_id + owned_morty_id to prevent cross-player ID collisions
+                    mortiesGlobalMap[`${m.player_id}_${m.owned_morty_id}`] = m;
                 }
             }
 
-            // Map and assemble the structural payload for users
+            // 4. Construct response payload for each active user
             for (const assignment of userDeckAssignments) {
                 const u = assignment.user;
                 const userOwnedMorties = [];
 
-                for (const targetId of assignment.deckIds) {
-                    const m = mortiesGlobalMap[targetId];
-                    // Ensure the Morty profile exists and truly belongs to the querying player context
-                    if (m && String(m.player_id) === String(u.player_id)) {
+                for (const targetOwnedMortyId of assignment.mortyIds) {
+                    const m = mortiesGlobalMap[`${u.player_id}_${targetOwnedMortyId}`];
+                    if (m) {
                         userOwnedMorties.push({
                             owned_morty_id: m.owned_morty_id,
                             morty_id: m.morty_id,
@@ -3558,12 +4282,17 @@ app.post('/session/room-details', async (req, res) => {
                         });
                     }
                 }
-				
-				
-				let currentPlacement = [30,35];
+
+                // Look up live position for ANY user (self or other players in room) using u.player_id
                 const livePos = livePlayerPositions.get(u.player_id);
 
-                if (livePos) { currentPlacement = [livePos.x,livePos.y]; }
+                let currentPlacement;
+                if (livePos) {
+                    currentPlacement = [livePos.x, livePos.y];
+                } else {
+                    // Optional fallback spawn position if position hasn't been broadcasted yet
+                    currentPlacement = [0, 0]; 
+                }
 
                 usersPayload.push({
                     player_id: u.player_id,
@@ -3571,175 +4300,36 @@ app.post('/session/room-details', async (req, res) => {
                     player_avatar_id: u.player_avatar_id,
                     level: Number(u.level || 0),
                     owned_morties: userOwnedMorties,
-                    state: u.state || "WORLD",
-					"shiny_if_potion": false,
-					"streak": u.streak,
-					placement: currentPlacement // Handled and overwritten immediately by the active UDP server loop
+                    state: u.state,
+                    shiny_if_potion: false,
+                    streak: u.streak,
+                    placement: currentPlacement
                 });
             }
         }
 
-        // --------------------------------------------------------------------
-        // 4. PICKUPS
-        // --------------------------------------------------------------------
-        const [pickupRows] = await pool.execute(`
-            SELECT pickup_id, placement, pick_up_contents 
-            FROM event_queue 
-            WHERE room_id = ? 
-              AND event_name = 'room:pickup-added' 
-              AND pickup_id_collected_by_player_id IS NULL
-        `, [roomId]);
-
-        const pickupsPayload = [];
-        for (const p of pickupRows) {
-            const pos = String(p.placement || "").split(',');
-            if (pos.length !== 2) continue;
-
-            let contents = [];
-            try {
-                const parsed = typeof p.pick_up_contents === 'string' 
-                    ? JSON.parse(p.pick_up_contents) 
-                    : p.pick_up_contents;
-                
-                if (parsed && typeof parsed === 'object') {
-                    contents = Array.isArray(parsed) ? parsed : [parsed];
-                }
-            } catch (e) {
-                contents = [];
-            }
-
-            pickupsPayload.push({
-                pickup_id: p.pickup_id,
-                placement: [Number(pos[0]), Number(pos[1])],
-                contents: contents
-            });
-        }
-
-        // --------------------------------------------------------------------
-        // 5. WILD MORTIES
-        // --------------------------------------------------------------------
-        const [wildRows] = await pool.execute(`
-            SELECT wild_morty_id, morty_id, placement, state, division, variant, shiny_if_potion, created_at, updated 
-            FROM event_queue 
-            WHERE room_id = ? 
-              AND event_name = 'room:wild-morty-added'
-        `, [roomId]);
-
-        const wildMortiesPayload = [];
-        for (const w of wildRows) {
-            const pos = String(w.placement || "").split(',');
-            if (pos.length !== 2) continue;
-
-            wildMortiesPayload.push({
-                morty_id: w.morty_id,
-                placement: [Number(pos[0]), Number(pos[1])],
-                state: w.state || "WORLD",
-                division: Number(w.division || 0),
-                variant: w.variant || "Normal",
-                shiny_if_potion: w.shiny_if_potion === true || w.shiny_if_potion === 1,
-                _created: iso8601Z(w.created_at),
-                _updated: iso8601Z(w.updated),
-                wild_morty_id: w.wild_morty_id
-            });
-        }
-
-        // --------------------------------------------------------------------
-        // 6. BOTS
-        // --------------------------------------------------------------------
-        const [botRows] = await pool.execute(`
-            SELECT bot_id, username, player_avatar_id, placement, state, division, zone_id, shiny_if_potion, owned_morties 
-            FROM event_queue 
-            WHERE room_id = ? 
-              AND event_name = 'room:bot-added'
-        `, [roomId]);
-
-        const botsPayload = [];
-        for (const b of botRows) {
-            const pos = String(b.placement || "0,0").split(',');
-            
-            let botMorties = [];
-            try {
-                botMorties = typeof b.owned_morties === 'string' 
-                    ? JSON.parse(b.owned_morties) 
-                    : b.owned_morties || [];
-            } catch (e) {
-                botMorties = [];
-            }
-
-            botsPayload.push({
-                username: b.username,
-                player_avatar_id: b.player_avatar_id,
-                state: b.state,
-                level: 1,
-                owned_morties: botMorties,
-                shiny_if_potion: b.shiny_if_potion === true || b.shiny_if_potion === 1,
-                streak: 0,
-                bot_id: b.bot_id,
-                placement: [Number(pos[0] || 0), Number(pos[1] || 0)]
-            });
-        }
-
-        // --------------------------------------------------------------------
-        // 7. baseline_event_id (Calculated but commented out matching source)
-        // --------------------------------------------------------------------
-        /*
-        const [baselineRows] = await pool.execute(`
-            SELECT COALESCE(MAX(id), 0) AS max_id 
-            FROM event_queue 
-            WHERE room_id = ?
-        `, [roomId]);
-        const baselineEventId = Number(baselineRows[0].max_id || 0);
-        */
+        const pickups = SpawnedItems.get(roomId) || populateRoomPickups(roomId);
+        const wild_morties = SpawnedMorties.get(roomId) || populateRoomMorties(roomId);
+        const bots = SpawnedBots.get(roomId) || populateRoomBots(roomId, parseInt(me.level || 1, 10));
 
         // --------------------------------------------------------------------
         // FINAL DISPATCH PIPELINE
         // --------------------------------------------------------------------
         return res.json({
-            room_id: room.room_id,
+            room_id: roomId,
             room_udp_host: room.room_udp_host,
             room_udp_port: String(room.room_udp_port || ""),
             world_id: String(room.world_id || ""),
             zone_id: room.zone_id,
             users: usersPayload,
-            pickups: pickupsPayload,
-            wild_morties: wildMortiesPayload,
-            bots: botsPayload
+            pickups: pickups,
+            wild_morties: wild_morties,
+            bots: bots
         });
 
     } catch (err) {
         console.error(">>> [ROOM DETAILS SYNC CRITICAL EXCEPTION]:", err);
         return res.status(500).json({ error: "Server error", detail: err.message });
-    }
-});
-
-// -------------------- AnatomyParkFTUE1 --------------------
-app.post('/session/battle-custom-battle', async (req, res) => {
-    // Match headers from your original PHP script
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    const session_id = req.body.session_id ? String(req.body.session_id) : '';
-    const dimension_id = req.body.dimension_id ? String(req.body.dimension_id) : '';
-
-    // 1. Validation check
-    if (session_id === '' || dimension_id === '') {
-        return res.status(400).json({
-            error: { code: "BAD_REQUEST" }
-        });
-    }
-
-    try {
-        // Optional: If you need to verify the session exists in the database before processing:
-        // await requireUserBySession(session_id);
-
-        return res.json({});
-
-    } catch (err) {
-        if (err.statusCode === 401) {
-            return res.status(401).json({
-                error: { code: "NOT_AUTHENTICATED" }
-            });
-        }
     }
 });
 
@@ -3831,22 +4421,32 @@ app.post('/session/dimensions/dispense-dimension-ftue-rewards', async (req, res)
 
         // 2. Business logic check for dimension_id '5'
         if (dimension_id === '5') {
-            return res.json({
-                dispensed: true
-            });
-        }
-        if (dimension_id === '6') {
-            return res.json({
-                dispensed: true
-            });
-        }
-        if (dimension_id === '7') {
         return res.json({
             rewards: [{
                 id: "AvatarFrank",
                 amount: 1,
                 type: "AVATAR",
                 player_avatar_id: "AvatarFrank"
+            }]
+        });
+        }
+        if (dimension_id === '6') {
+        return res.json({
+            rewards: [{
+                id: "AvatarDrXenonBloom",
+                amount: 1,
+                type: "AVATAR",
+                player_avatar_id: "AvatarDrXenonBloom"
+            }]
+        });
+        }
+        if (dimension_id === '7') {
+        return res.json({
+            rewards: [{
+                id: "AvatarBethTheDestroyer",
+                amount: 1,
+                type: "AVATAR",
+                player_avatar_id: "AvatarBethTheDestroyer"
             }]
         });
         }
@@ -3922,6 +4522,14 @@ app.post('/user/register', async (req, res) => {
     let connection;
     try {
         connection = await pool.getConnection();
+		
+		// Check if users ip address already exists
+        //const [useriPCheck] = await connection.execute('SELECT 1 FROM users WHERE created_with_ip = ?', [ip]);
+        //if (useriPCheck.length > 0) {
+        //    return res.status(400).json({
+        //        error: { code: "USERNAME_LOGIN_ERROR" }
+        //    });
+        //}
 
         // Check if a recovery code layout entry profile exists
         // Replaces: SELECT id, recovery_code_hash FROM users LIMIT 1
@@ -4003,15 +4611,9 @@ app.post('/user/register', async (req, res) => {
 
                 // stmt_6: Generate first default Morty assignment context
                 await connection.execute(`
-                    INSERT INTO owned_morties (player_id, owned_morty_id, morty_id, level, xp, hp, hp_stat, attack_stat, defence_stat, variant, speed_stat, is_locked, is_trading_locked, fight_pit_id, evolution_points, xp_lower, xp_upper)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                `, [player_id, owned_morty_id, 'MortyDefault', '5', '125', '20', '20', '11', '10', 'Normal', '10', '0', 'false', 'null', '0', '125', '216']);
-
-                // stmt_7: Inject standard attack patterns mapped mapping context execution
-                await connection.execute(`
-                    INSERT INTO owned_attacks (owned_morty_id, attack_id, position, pp, pp_stat)
-                    VALUES (?, ?, ?, ?, ?)
-                `, [owned_morty_id, 'AttackOutburst', '0', '12', '12']);
+                    INSERT INTO owned_morties (player_id, owned_morty_id, morty_id, level, xp, hp, hp_stat, attack_stat, defence_stat, variant, speed_stat, is_locked, is_trading_locked, fight_pit_id, evolution_points, xp_lower, xp_upper, attacks_array)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `, [player_id, owned_morty_id, 'MortyDefault', '5', '125', '20', '20', '11', '10', 'Normal', '10', '0', 'false', 'null', '0', '125', '216', '{"attack_id":"AttackOutburst","pp":12,"pp_stat":12,"position":0}']);
 
                 await connection.commit();
                 success = true;
@@ -4036,14 +4638,29 @@ app.post('/user/register', async (req, res) => {
 
         const [mortyRows] = await connection.execute('SELECT * FROM owned_morties WHERE player_id = ?', [player_id]);
         
-        // Dynamically bundle child attack listings into each extracted array
-        for (let morty of mortyRows) {
-            const [attackRows] = await connection.execute(
-                'SELECT attack_id, position, pp, pp_stat FROM owned_attacks WHERE owned_morty_id = ?',
-                [morty.owned_morty_id]
-            );
-            morty.owned_attacks = attackRows;
+for (let morty of mortyRows) {
+
+    let attacks = morty.attacks_array;
+
+    // Convert string JSON to object if needed
+    if (typeof attacks === "string") {
+        try {
+            attacks = JSON.parse(attacks);
+        } catch (err) {
+            attacks = null;
         }
+    }
+
+    // Wrap single attack object into array
+    if (attacks && !Array.isArray(attacks)) {
+        attacks = [attacks];
+    }
+
+    morty.owned_attacks = attacks || [];
+
+    // Remove database field if you don't want it returned
+    delete morty.attacks_array;
+}
 
         const [deckRows] = await connection.execute('SELECT deck_id, owned_morty_ids FROM decks WHERE player_id = ?', [player_id]);
         for (let deck of deckRows) {
@@ -4139,9 +4756,6 @@ app.post('/session/dispense-item', async (req, res) => {
 
         // 4. Success payload response
         return res.json({
-            id: item_id,
-            amount: 1,
-            type: "ITEM",
             item_id: item_id
         });
 
@@ -4619,6 +5233,29 @@ app.post('/session/heal', async (req, res) => {
         return [];
     };
 
+    const parseAttacksArray = (rawAttacks) => {
+        if (!rawAttacks) return [];
+        let parsed = rawAttacks;
+        if (typeof rawAttacks === 'string') {
+            try {
+                parsed = JSON.parse(rawAttacks);
+            } catch (e) {
+                return [];
+            }
+        }
+        if (!Array.isArray(parsed)) return [];
+
+        return parsed.map((a, idx) => {
+            const maxPp = Number(a.pp_stat ?? a.max_pp ?? a.pp ?? 0);
+            return {
+                attack_id: String(a.attack_id || ''),
+                pp: Number(a.pp ?? maxPp),
+                pp_stat: maxPp,
+                position: Number(a.position ?? idx)
+            };
+        });
+    };
+
     let connection;
 
     try {
@@ -4658,21 +5295,29 @@ app.post('/session/heal', async (req, res) => {
 
         const placeholders = ownedIds.map(() => '?').join(',');
 
-        // Heal HP to full
-        const sqlHp = `
-            UPDATE owned_morties
-            SET hp = hp_stat
-            WHERE player_id = ? AND owned_morty_id IN (${placeholders})
-        `;
-        await connection.execute(sqlHp, [player_id, ...ownedIds]);
+        // 3a) Fetch current morties to read their JSON attacks_array
+        const [rowsToHeal] = await connection.execute(
+            `SELECT owned_morty_id, hp_stat, attacks_array FROM owned_morties WHERE player_id = ? AND owned_morty_id IN (${placeholders})`,
+            [player_id, ...ownedIds]
+        );
 
-        // Heal PP to full
-        const sqlPp = `
-            UPDATE owned_attacks
-            SET pp = pp_stat
-            WHERE owned_morty_id IN (${placeholders})
-        `;
-        await connection.execute(sqlPp, ownedIds);
+        // 3b) Update each Morty's HP to hp_stat and restore PP in attacks_array JSON array
+        for (const row of rowsToHeal) {
+            const attacks = parseAttacksArray(row.attacks_array);
+            const healedAttacks = attacks.map(att => ({
+                attack_id: att.attack_id,
+                pp: att.pp_stat, // Restore PP to full
+                pp_stat: att.pp_stat,
+                position: att.position
+            }));
+
+            await connection.execute(
+                `UPDATE owned_morties 
+                 SET hp = hp_stat, attacks_array = ? 
+                 WHERE player_id = ? AND owned_morty_id = ?`,
+                [JSON.stringify(healedAttacks), player_id, row.owned_morty_id]
+            );
+        }
 
         await connection.commit();
 
@@ -4685,29 +5330,7 @@ app.post('/session/heal', async (req, res) => {
         `;
         const [morties] = await pool.execute(sqlMorties, [player_id, ...ownedIds, ...ownedIds]);
 
-        // 5) Fetch attacks
-        const sqlAttacks = `
-            SELECT owned_morty_id, attack_id, position, pp, pp_stat
-            FROM owned_attacks
-            WHERE owned_morty_id IN (${placeholders})
-            ORDER BY owned_morty_id ASC, position ASC
-        `;
-        const [attRows] = await pool.execute(sqlAttacks, ownedIds);
-
-        // Group attacks by owned_morty_id
-        const attByOwned = {};
-        for (const a of attRows) {
-            const oid = String(a.owned_morty_id);
-            if (!attByOwned[oid]) attByOwned[oid] = [];
-            attByOwned[oid].push({
-                attack_id: String(a.attack_id),
-                position: Number(a.position),
-                pp: Number(a.pp),
-                pp_stat: Number(a.pp_stat)
-            });
-        }
-
-        // 6) Build owned_morties array maintaining deck order
+        // 5) Build owned_morties array maintaining deck order
         const mortyById = {};
         for (const m of morties) {
             mortyById[String(m.owned_morty_id)] = m;
@@ -4723,7 +5346,7 @@ app.post('/session/heal', async (req, res) => {
                 morty_id: String(m.morty_id),
                 level: Number(m.level),
                 xp: Number(m.xp),
-                hp: Number(m.hp),
+                hp: Number(m.hp_stat), // Returns fully healed HP
                 hp_stat: Number(m.hp_stat),
                 attack_stat: Number(m.attack_stat),
                 defence_stat: Number(m.defence_stat),
@@ -4733,13 +5356,18 @@ app.post('/session/heal', async (req, res) => {
                 is_trading_locked: toBool(m.is_trading_locked),
                 fight_pit_id: toNull(m.fight_pit_id),
                 evolution_points: Number(m.evolution_points || 0),
-                owned_attacks: attByOwned[oid] || [],
+                owned_attacks: parseAttacksArray(m.attacks_array).map(a => ({
+                    attack_id: a.attack_id,
+                    position: a.position,
+                    pp: a.pp_stat, // Returns fully healed PP
+                    pp_stat: a.pp_stat
+                })),
                 xp_lower: Number(m.xp_lower || 0),
                 xp_upper: Number(m.xp_upper || 0)
             });
         }
 
-        // 7) Output Player payload
+        // 6) Output Player payload
         const player = {
             player_id: String(user.player_id),
             username: String(user.username),
@@ -4771,14 +5399,6 @@ app.post('/session/heal', async (req, res) => {
             connection.release();
         }
     }
-});
-
-// Handle preflight OPTIONS requests for CORS
-app.options('/session/heal', (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    return res.sendStatus(204);
 });
 
 
@@ -4884,6 +5504,7 @@ app.post('/session/owned_morties/lock', async (req, res) => {
     }
 });
 
+// -------------------- INITIATE BOT BATTLE (PvB) --------------------
 app.post('/session/battle-bot', async (req, res) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -5135,15 +5756,17 @@ const opponentPayload = {
         const playerActiveMortyId = activeOwnedMorty;
         const matchedActiveMorty = ownedMortiesPayloadArray.find(m => m.owned_morty_id === activeOwnedMorty);
         const playerHpValue = matchedActiveMorty ? matchedActiveMorty.hp : 0;
+		
+		const battleType = "PvB";
 
         await pool.execute(`
             INSERT INTO battles (
-                battle_id, player_id, bot_id, 
+                battle_id, battle_type, player_id, bot_id, 
                 opponent_active_morty, opponent_morty_id, opponent_hp, 
                 player_active_morty, player_hp, state, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', NOW())
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', NOW())
         `, [
-            battleId, playerId, botIdInput,
+            battleId, battleType, playerId, botIdInput,
             opponentActiveMortyId, opponentMortyTemplateId, opponentHpValue,
             playerActiveMortyId, playerHpValue
         ]);
@@ -5151,7 +5774,7 @@ const opponentPayload = {
         // 12. Broadcast operational synchronization signals to SSE lines
         const finalBroadcastPayload = {
             battle_id: battleId,
-            battle_type: "PvB",
+            battle_type: battleType,
             player: playerPayload,
             opponent: opponentPayload,
             meta: {}
@@ -5168,6 +5791,1624 @@ const opponentPayload = {
         return res.status(500).json({ success: false, error: "Server error", detail: err.message });
     }
 });
+
+// -------------------- Anatomy Park FTUE1 PvCB --------------------
+app.post('/session/battle-custom-battle', async (req, res) => {
+    // Match headers from your original PHP script
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    const session_id = req.body.session_id ? String(req.body.session_id) : '';
+    const dimension_id = req.body.dimension_id ? String(req.body.dimension_id) : '';
+
+    // 1. Validation check
+    if (session_id === '' || dimension_id === '') {
+        return res.status(400).json({
+            error: { code: "BAD_REQUEST" }
+        });
+    }
+
+    try {
+        // Optional: If you need to verify the session exists in the database before processing:
+        // await requireUserBySession(session_id);
+
+        return res.json({});
+
+    } catch (err) {
+        if (err.statusCode === 401) {
+            return res.status(401).json({
+                error: { code: "NOT_AUTHENTICATED" }
+            });
+        }
+    }
+});
+
+app.post('/session/battle-boss', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Vary', 'Accept-Encoding');
+
+  // Express sets X-Powered-By: Express automatically by default,
+  // but you can set it explicitly if needed:
+  res.setHeader('X-Powered-By', 'Express');
+
+  res.json({
+    success: true
+  });
+});
+
+
+// -------------------- PvF --------------------
+app.post('/session/battle-invite/create', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Vary', 'Accept-Encoding');
+  res.setHeader('X-Powered-By', 'Express');
+
+  try {
+    const { session_id, opponent_player_id, battle_type } = req.body;
+
+    if (!session_id || !opponent_player_id || !battle_type) {
+      return res.status(400).json({ success: false, error: 'Missing required fields' });
+    }
+
+    // 1. Resolve active user session context and sender's active deck ID
+    const [userRows] = await pool.execute(
+        "SELECT player_id, username, player_avatar_id, level, room_id, active_deck_id FROM users WHERE session_id = ? LIMIT 1",
+        [session_id]
+    );
+    if (!userRows.length) {
+        return res.status(401).json({ success: false, error: "Not authenticated" });
+    }
+
+    const sender = userRows[0];
+    const playerId = String(sender.player_id);
+    const username = String(sender.username);
+    const player_avatar_id = String(sender.player_avatar_id);
+    const player_level = String(sender.level);
+    const roomId = String(sender.room_id || "");
+
+    if (!roomId || roomId === "0") {
+        return res.status(409).json({ success: false, error: "Player is not in a room" });
+    }
+
+    // 2. Validate targeted room container instance
+    const [roomRows] = await pool.execute(
+        "SELECT 1 FROM room_ids WHERE room_id = ? LIMIT 1",
+        [roomId]
+    );
+    if (!roomRows.length) {
+        return res.status(409).json({ success: false, error: "Room does not exist", room_id: roomId });
+    }
+
+    // 3. Fetch opponent's user profile data and active_deck_id
+    const [opponentRows] = await pool.execute(
+        "SELECT player_id, username, player_avatar_id, level, active_deck_id FROM users WHERE player_id = ? LIMIT 1",
+        [opponent_player_id]
+    );
+    if (!opponentRows.length) {
+        return res.status(404).json({ success: false, error: "Opponent player not found" });
+    }
+
+    const opponent = opponentRows[0];
+
+    // Robust helper with debugging logs to trace data flow
+    const getMortiesFromActiveDeck = async (targetPlayerId, activeDeckId) => {
+        //console.log(`[DEBUG] Looking up active_deck_id: ${activeDeckId} for player_id: ${targetPlayerId}`);
+        
+        if (activeDeckId === null || activeDeckId === undefined) {
+            //console.log(`[DEBUG] active_deck_id is null/undefined for player ${targetPlayerId}`);
+            return [];
+        }
+
+        // Grab the row from the decks table
+        const [deckRows] = await pool.query(
+            "SELECT owned_morty_ids FROM decks WHERE player_id = ? AND deck_id = ? LIMIT 1",
+            [targetPlayerId, activeDeckId]
+        );
+
+        if (!deckRows.length) {
+            //console.log(`[DEBUG] No deck found in 'decks' table for player_id: ${targetPlayerId} and deck_id: ${activeDeckId}`);
+            return [];
+        }
+
+        //console.log(`[DEBUG] Raw deck row found:`, deckRows[0]);
+
+        const rawIds = deckRows[0].owned_morty_ids;
+        let mortyIdsArray = [];
+
+        try {
+            if (typeof rawIds === 'string') {
+                // Try parsing as JSON first
+                mortyIdsArray = JSON.parse(rawIds);
+            } else if (Array.isArray(rawIds)) {
+                mortyIdsArray = rawIds;
+            }
+        } catch (e) {
+            // If JSON parse fails, fallback to comma separation or plain string conversion
+            mortyIdsArray = String(rawIds).split(',').map(id => id.trim()).filter(Boolean);
+        }
+
+        if (!Array.isArray(mortyIdsArray)) {
+            mortyIdsArray = [mortyIdsArray];
+        }
+
+        //console.log(`[DEBUG] Extracted owned_morty_ids array:`, mortyIdsArray);
+
+        if (mortyIdsArray.length === 0) return [];
+
+        const placeholders = mortyIdsArray.map(() => '?').join(',');
+
+        // Query owned_morties matching the player and extracted IDs
+        // Note: owned_morty_id is a text field in owned_morties, so we match against it
+        const [morties] = await pool.query(
+            `SELECT owned_morty_id, morty_id, hp, variant, is_locked, is_trading_locked, fight_pit_id 
+             FROM owned_morties 
+             WHERE player_id = ? AND owned_morty_id IN (${placeholders})`,
+            [targetPlayerId, ...mortyIdsArray]
+        );
+
+        //console.log(`[DEBUG] Successfully fetched ${morties.length} morties from owned_morties`);
+        return morties;
+    };
+
+    // Fetch opponent's exact active deck morties
+    const opponentMortiesRows = await getMortiesFromActiveDeck(opponent_player_id, opponent.active_deck_id);
+
+    // Fetch sender's exact active deck morties
+    const senderMortiesRows = await getMortiesFromActiveDeck(playerId, sender.active_deck_id);
+
+    // 4. Generate invite metadata
+    const battleInviteId = uuidv4();
+    const battleInviteTtl = 25; // seconds
+
+    // 5. Generate the JWT token for the invite
+    const tokenPayload = {
+      from_player_id: playerId,
+      to_player_id: opponent_player_id,
+      battle_invite_id: battleInviteId,
+      battle_type: battle_type
+    };
+
+    const token = jwt.sign(tokenPayload, process.env.JWT_SECRET || 'super_secret_battle_key_2026', { expiresIn: `${battleInviteTtl}s` });
+
+    // 6. Construct HTTP response payload
+    const payload = {
+      battle_invite_id: battleInviteId,
+      battle_invite_ttl: battleInviteTtl,
+      to_player: {
+        player_id: String(opponent.player_id),
+        username: String(opponent.username),
+        player_avatar_id: String(opponent.player_avatar_id),
+        level: Number(opponent.level),
+        owned_morties: opponentMortiesRows
+      },
+      token: token,
+      battle_type: battle_type
+    };
+
+    // 7. Construct Event payload
+    const eventpayload = {
+      battle_invite_id: battleInviteId,
+      battle_invite_ttl: battleInviteTtl,
+      from_player: {
+        player_id: String(playerId),
+        username: String(username),
+        player_avatar_id: String(player_avatar_id),
+        level: Number(player_level),
+        owned_morties: senderMortiesRows
+      },
+      token: token,
+      battle_type: battle_type
+    };
+
+    // 8. Publish the event to the room
+    await publishEvent(roomId, "battle-invite:received", eventpayload, opponent.player_id);
+
+    // 9. Return the full structured payload to the HTTP response
+    res.json(payload);
+
+  } catch (error) {
+    //console.error('Error creating battle invite:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+app.post('/session/battle-invite/response', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Vary', 'Accept-Encoding');
+  res.setHeader('X-Powered-By', 'Express');
+
+  try {
+    const { session_id, token, accept } = req.body;
+
+    if (!session_id || !token || typeof accept !== 'boolean') {
+      return res.status(400).json({ success: false, error: 'Missing required fields or invalid types' });
+    }
+
+    // 1. Verify and decode the JWT battle invite token
+    let decodedToken;
+    try {
+      decodedToken = jwt.verify(token, process.env.JWT_SECRET || 'super_secret_battle_key_2026');
+    } catch (err) {
+      return res.status(401).json({ success: false, error: 'Invalid or expired battle invite token' });
+    }
+
+    const { from_player_id, to_player_id, battle_invite_id, battle_type } = decodedToken;
+
+    // 2. Resolve the responding user (must be the recipient: to_player_id)
+    const [userRows] = await pool.execute(
+        "SELECT player_id, username, player_avatar_id, level, room_id FROM users WHERE session_id = ? LIMIT 1",
+        [session_id]
+    );
+    if (!userRows.length) {
+        return res.status(401).json({ success: false, error: "Not authenticated" });
+    }
+
+    const responder = userRows[0];
+    const responderPlayerId = String(responder.player_id);
+    const roomId = String(responder.room_id || "");
+
+    // Verify that the user responding matches the intended target of the invite
+    if (responderPlayerId !== String(to_player_id)) {
+        return res.status(403).json({ success: false, error: "Unauthorized to respond to this invite" });
+    }
+
+    if (!roomId || roomId === "0") {
+        return res.status(409).json({ success: false, error: "Player is not in a room" });
+    }
+
+    // 3. Fetch sender details for the event payload mapping
+    const [senderRows] = await pool.execute(
+        "SELECT player_id, username, player_avatar_id, level FROM users WHERE player_id = ? LIMIT 1",
+        [from_player_id]
+    );
+    if (!senderRows.length) {
+        return res.status(404).json({ success: false, error: "Inviting player not found" });
+    }
+    const sender = senderRows[0];
+
+    // 4. Handle Acceptance vs Declination logic
+    if (!accept) {
+      // Publish decline event to the inviting player
+      const declineEventPayload = {
+        battle_invite_id: battle_invite_id
+      };
+
+      await publishEvent(roomId, "battle-invite:declined", declineEventPayload, from_player_id);
+
+      return res.json({ success: true, accepted: false });
+    }
+
+    // If accepted: Publish accepted event back to the sender
+    const acceptEventPayload = {
+      battle_invite_id: battle_invite_id,
+      battle_type: battle_type,
+      opponent: {
+        player_id: String(responder.player_id),
+        username: String(responder.username)
+      }
+    };
+
+    await publishEvent(roomId, "battle-invite:accepted", acceptEventPayload, from_player_id);
+
+    // Return successful response to responder including opponent profile details
+    res.json({
+      success: true,
+      accepted: true,
+      battle_invite_id: battle_invite_id,
+      battle_type: battle_type,
+      opponent: {
+        player_id: String(sender.player_id),
+        username: String(sender.username)
+      }
+    });
+
+  } catch (error) {
+    console.error('Error handling battle invite response:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+app.post('/session/battle-invite/revoke', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Vary', 'Accept-Encoding');
+
+  // Express sets X-Powered-By: Express automatically by default,
+  // but you can set it explicitly if needed:
+  res.setHeader('X-Powered-By', 'Express');
+
+  res.json({
+    success: true
+  });
+});
+
+
+
+
+
+
+
+
+
+
+
+app.post('/arena/events/list', (req, res) => {
+    // 1. Set required HTTP headers matching the Pocket Mortys client expectations
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    // 2. Define active arena/event configuration
+    // (You can move these values to your DB or a dynamic config file later)
+    const eventConfig = {
+        event_id: "daddb670-cdca-11ef-aa7c-d3a467998ef3",
+        current_phase: "active",
+        starting_energy: 100,
+        energy_refill_time_minutes: 10,
+        battle_energy_cost: 0,
+        battle_premium_energy_cost: 0,
+        max_regen_energy: 100,
+        maintenance: false
+    };
+
+    // 3. Construct the response payload
+    const responsePayload = {
+        events: [
+            {
+                event_id: eventConfig.event_id,
+                current_phase: eventConfig.current_phase,
+                reward_time_remaining: 739971457,
+                phase_time_remaining: 737971457,
+                data_time: new Date().toISOString(),
+                starting_energy: eventConfig.starting_energy,
+                energy_refill_time_minutes: eventConfig.energy_refill_time_minutes,
+                battle_energy_cost: eventConfig.battle_energy_cost,
+                battle_premium_energy_cost: eventConfig.battle_premium_energy_cost,
+                max_regen_energy: eventConfig.max_regen_energy,
+                maintenance: eventConfig.maintenance
+            }
+        ]
+    };
+
+    // 4. Send response
+    return res.status(200).json(responsePayload);
+});
+
+
+
+app.post('/arena/scores/list', async (req, res) => {
+    // 1. Set standard response headers
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    const eventId = req.query.event_id || req.body?.event_id || "dace41f4-cdca-11ef-acec-8f82efc7517f";
+    const currentPlayerId = req.headers['x-player-id'] || req.query.player_id || "dfd1bb4f-5a40-4841-ac32-d4ae2ba72b1f";
+    const nowIso = new Date().toISOString();
+
+    try {
+        /* 
+        // Example MySQL Query Structure:
+        const [scoreRows] = await pool.execute(`
+            SELECT 
+                player_id, username, last_battle_time, avatar, level, 
+                event_id, shard_id, score, streak, reward_rank, 
+                team_json, rank_id, index_num, is_player, target
+            FROM arena_leaderboard 
+            WHERE event_id = ? 
+            ORDER BY score DESC 
+            LIMIT 50
+        `, [eventId]);
+        */
+
+        // 2. Default/Mock Leaderboard Payload (matching your structure)
+        const scoreResults = [
+		    {
+                player_id: currentPlayerId,
+                username: "ConspiracyRick",
+                last_battle_time: nowIso,
+                avatar: "AvatarScroogeRick",
+                level: 13,
+                event_id: eventId,
+                shard_id: 3,
+                score: 9999,
+                streak: 1,
+                current_time: nowIso,
+                reward_rank: 1,
+                team_details: [],
+                team: [
+                    { id: "MortyOrangeShirt", variant: "Normal" },
+                    { id: "MortySpace", variant: "Normal" },
+                    { id: "MortyBossJerry", variant: "Normal" },
+                    { id: "MortyHippie", variant: "Normal" },
+                    { id: "MortyDragonsSweat", variant: "Shiny" }
+                ],
+                rank_id: 1,
+                index: 2,
+                is_player: true,
+                target: 126
+            },
+            {
+                player_id: "97ed62f6-db9c-4f4f-9db0-013b7bbf904d",
+                username: "killingintheofna",
+                last_battle_time: "2026-01-15T05:31:27.787Z",
+                avatar: "AvatarRickGrunge",
+                level: 2,
+                event_id: eventId,
+                shard_id: 3,
+                score: 150,
+                streak: 1,
+                current_time: nowIso,
+                reward_rank: 2,
+                team_details: [],
+                team: [
+                    { id: "MortyDefault", variant: "Normal" },
+                    { id: "MortySquid", variant: "Shiny" },
+                    { id: "MortyDethklokFan", variant: "Normal" },
+                    { id: "MortyFestival", variant: "Normal" },
+                    { id: "MortyAsstManager", variant: "Normal" }
+                ],
+                rank_id: 2,
+                index: 3
+            },
+            {
+                player_id: "4f43e7e5-4381-4829-afd3-0d3c3d40c094",
+                username: "MandatoryMilitar",
+                last_battle_time: "2026-01-15T05:21:46.057Z",
+                avatar: "AvatarRickSupremeGuard",
+                level: 39,
+                event_id: eventId,
+                shard_id: 3,
+                score: 150,
+                streak: 1,
+                current_time: nowIso,
+                reward_rank: 3,
+                team_details: [],
+                team: [
+                    { id: "MortyTheOneTrue", variant: "Normal" },
+                    { id: "MortySeason4", variant: "Normal" },
+                    { id: "MortyGotron", variant: "Normal" },
+                    { id: "MortyGotron", variant: "Normal" },
+                    { id: "MortyQueen", variant: "Normal" }
+                ],
+                rank_id: 3,
+                index: 4
+            }
+        ];
+
+        // Ensure current_time is dynamically synced for all results
+        const updatedResults = scoreResults.map(entry => ({
+            ...entry,
+            current_time: nowIso
+        }));
+
+        // 3. Assemble full response object
+        const responseData = {
+            id: eventId,
+            results: updatedResults,
+            promotion_trophy_amount: 161,
+            relegation_trophy_amount: 128
+        };
+
+        return res.status(200).json(responseData);
+
+    } catch (err) {
+        console.error("Error retrieving arena scores:", err);
+        return res.status(500).json({ error: "Internal Server Error" });
+    }
+});
+
+
+app.post('/arena/energy/fetch', async (req, res) => {
+    // 1. Set standard response headers expected by Unity client
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    try {
+        // Extract player ID from headers or request body
+        const playerId = req.headers['x-player-id'] || req.body?.player_id;
+
+        // Default values when energy is full
+        let energyAmount = 100;
+        let energyTime = null; // null indicates energy is at max capacity / not currently regenerating
+
+        /* 
+        // Example DB Integration Logic:
+        if (playerId) {
+            const [rows] = await pool.execute(
+                `SELECT energy_amount, energy_time FROM player_arena_energy WHERE player_id = ?`,
+                [playerId]
+            );
+
+            if (rows.length > 0) {
+                energyAmount = rows[0].energy_amount;
+                // energy_time represents ISO timestamp or Unix timestamp when next unit regenerates
+                energyTime = rows[0].energy_time ? new Date(rows[0].energy_time).toISOString() : null;
+            }
+        }
+        */
+
+        // Construct response payload
+        const responsePayload = {
+            energy_amount: energyAmount,
+            energy_time: energyTime
+        };
+
+        return res.status(200).json(responsePayload);
+
+    } catch (err) {
+        console.error("Error handling /arena/energy/fetch:", err);
+        
+        // Fallback response in case of database or parsing errors
+        return res.status(200).json({
+            energy_amount: 100,
+            energy_time: null
+        });
+    }
+});
+
+
+app.post('/arena/rewards/list', (req, res) => {
+    // 1. Set standard response headers matching client requirements
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    // 2. Define the rewards payload structure
+    const rewardsPayload = {
+        rewards: [
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 11,
+                bracket_end: 50,
+                base_quantity: 1,
+                base_type: "MORTY",
+                sort_order: 1,
+                base_parameters: { ids: ["MortyBronzeAge"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 201,
+                bracket_end: 400,
+                base_quantity: 1,
+                base_type: "MORTY",
+                sort_order: 1,
+                base_parameters: { ids: ["MortyStoneAge"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 651,
+                bracket_end: 1000,
+                base_quantity: 1,
+                base_type: "COUPON",
+                sort_order: 1,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 401,
+                bracket_end: 650,
+                base_quantity: 1,
+                base_type: "MORTY",
+                sort_order: 1,
+                base_parameters: { ids: ["MortyStoneAge"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 101,
+                bracket_end: 200,
+                base_quantity: 1,
+                base_type: "MORTY",
+                sort_order: 1,
+                base_parameters: { ids: ["MortyStoneAge"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 1001,
+                bracket_end: 1500,
+                base_quantity: 1,
+                base_type: "ITEM",
+                sort_order: 1,
+                base_parameters: { ids: ["ItemSerum"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 51,
+                bracket_end: 100,
+                base_quantity: 1,
+                base_type: "MORTY",
+                sort_order: 1,
+                base_parameters: { ids: ["MortyBronzeAge"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 1,
+                bracket_end: 1,
+                base_quantity: 1,
+                base_type: "MORTY",
+                sort_order: 1,
+                base_parameters: { ids: ["MortyIronAge"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 3,
+                bracket_end: 3,
+                base_quantity: 1,
+                base_type: "MORTY",
+                sort_order: 1,
+                base_parameters: { ids: ["MortyIronAge"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 1501,
+                bracket_end: 2000,
+                base_quantity: 1,
+                base_type: "ITEM",
+                sort_order: 1,
+                base_parameters: { ids: ["ItemSerum"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 2,
+                bracket_end: 2,
+                base_quantity: 1,
+                base_type: "MORTY",
+                sort_order: 1,
+                base_parameters: { ids: ["MortyIronAge"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 4,
+                bracket_end: 10,
+                base_quantity: 1,
+                base_type: "MORTY",
+                sort_order: 1,
+                base_parameters: { ids: ["MortyIronAge"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 3,
+                bracket_end: 3,
+                base_quantity: 4,
+                base_type: "COUPON",
+                sort_order: 2,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 101,
+                bracket_end: 200,
+                base_quantity: 2,
+                base_type: "COUPON",
+                sort_order: 2,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 201,
+                bracket_end: 400,
+                base_quantity: 2,
+                base_type: "COUPON",
+                sort_order: 2,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 2,
+                bracket_end: 2,
+                base_quantity: 5,
+                base_type: "COUPON",
+                sort_order: 2,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 401,
+                bracket_end: 650,
+                base_quantity: 3,
+                base_type: "ITEM",
+                sort_order: 2,
+                base_parameters: { ids: ["ItemSerum"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 401,
+                bracket_end: 650,
+                base_quantity: 1,
+                base_type: "COUPON",
+                sort_order: 2,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 4,
+                bracket_end: 10,
+                base_quantity: 3,
+                base_type: "COUPON",
+                sort_order: 2,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 51,
+                bracket_end: 100,
+                base_quantity: 2,
+                base_type: "COUPON",
+                sort_order: 2,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 1,
+                bracket_end: 1,
+                base_quantity: 7,
+                base_type: "COUPON",
+                sort_order: 2,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 651,
+                bracket_end: 1000,
+                base_quantity: 2,
+                base_type: "ITEM",
+                sort_order: 2,
+                base_parameters: { ids: ["ItemSerum"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 11,
+                bracket_end: 50,
+                base_quantity: 3,
+                base_type: "COUPON",
+                sort_order: 2,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 101,
+                bracket_end: 200,
+                base_quantity: 2,
+                base_type: "ITEM",
+                sort_order: 2,
+                base_parameters: { ids: ["ItemGreatSerum"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 1,
+                bracket_end: 1,
+                base_quantity: 1,
+                base_type: "ITEM",
+                sort_order: 3,
+                base_parameters: { ids: ["ItemSensationalSerum"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 101,
+                bracket_end: 200,
+                base_quantity: 1,
+                base_type: "ITEM",
+                sort_order: 3,
+                base_parameters: { ids: ["ItemMegaSeedSpeed"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 11,
+                bracket_end: 50,
+                base_quantity: 3,
+                base_type: "ITEM",
+                sort_order: 3,
+                base_parameters: { ids: ["ItemGreatSerum"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 3,
+                bracket_end: 3,
+                base_quantity: 1,
+                base_type: "ITEM",
+                sort_order: 3,
+                base_parameters: { ids: ["ItemSensationalSerum"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 51,
+                bracket_end: 100,
+                base_quantity: 2,
+                base_type: "ITEM",
+                sort_order: 3,
+                base_parameters: { ids: ["ItemGreatSerum"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 2,
+                bracket_end: 2,
+                base_quantity: 1,
+                base_type: "ITEM",
+                sort_order: 3,
+                base_parameters: { ids: ["ItemSensationalSerum"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 201,
+                bracket_end: 400,
+                base_quantity: 2,
+                base_type: "ITEM",
+                sort_order: 3,
+                base_parameters: { ids: ["ItemGreatSerum"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 4,
+                bracket_end: 10,
+                base_quantity: 1,
+                base_type: "ITEM",
+                sort_order: 4,
+                base_parameters: { ids: ["ItemSensationalSerum"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 2,
+                bracket_end: 2,
+                base_quantity: 3,
+                base_type: "ITEM",
+                sort_order: 4,
+                base_parameters: { ids: ["ItemMegaSeedSpeed"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 3,
+                bracket_end: 3,
+                base_quantity: 3,
+                base_type: "ITEM",
+                sort_order: 4,
+                base_parameters: { ids: ["ItemMegaSeedSpeed"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 51,
+                bracket_end: 100,
+                base_quantity: 1,
+                base_type: "ITEM",
+                sort_order: 4,
+                base_parameters: { ids: ["ItemMegaSeedSpeed"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 1,
+                bracket_end: 1,
+                base_quantity: 4,
+                base_type: "ITEM",
+                sort_order: 4,
+                base_parameters: { ids: ["ItemMegaSeedSpeed"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 3,
+                bracket_end: 3,
+                base_quantity: 1,
+                base_type: "ITEM",
+                sort_order: 5,
+                base_parameters: { ids: ["ItemMegaSeedAttack"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 2,
+                bracket_end: 2,
+                base_quantity: 1,
+                base_type: "ITEM",
+                sort_order: 5,
+                base_parameters: { ids: ["ItemMegaSeedAttack"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 11,
+                bracket_end: 50,
+                base_quantity: 1,
+                base_type: "ITEM",
+                sort_order: 5,
+                base_parameters: { ids: ["ItemMegaSeedSpeed"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 1,
+                bracket_end: 1,
+                base_quantity: 2,
+                base_type: "ITEM",
+                sort_order: 5,
+                base_parameters: { ids: ["ItemMegaSeedAttack"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 4,
+                bracket_end: 10,
+                base_quantity: 2,
+                base_type: "ITEM",
+                sort_order: 5,
+                base_parameters: { ids: ["ItemMegaSeedSpeed"] }
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 101,
+                bracket_end: 200,
+                base_quantity: 900,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 4,
+                bracket_end: 10,
+                base_quantity: 1300,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 201,
+                bracket_end: 400,
+                base_quantity: 800,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 3501,
+                bracket_end: 8000,
+                base_quantity: 100,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 651,
+                bracket_end: 1000,
+                base_quantity: 600,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 2,
+                bracket_end: 2,
+                base_quantity: 1750,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 51,
+                bracket_end: 100,
+                base_quantity: 1000,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 11,
+                bracket_end: 50,
+                base_quantity: 1100,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 2501,
+                bracket_end: 3500,
+                base_quantity: 150,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 1501,
+                bracket_end: 2000,
+                base_quantity: 400,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 1,
+                bracket_end: 1,
+                base_quantity: 2000,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 2001,
+                bracket_end: 2500,
+                base_quantity: 200,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 1001,
+                bracket_end: 1500,
+                base_quantity: 500,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 401,
+                bracket_end: 650,
+                base_quantity: 700,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            },
+            {
+                rewards_name: "REWARDS_LIVE_Through_Ages_Morty",
+                bracket_start: 3,
+                bracket_end: 3,
+                base_quantity: 1500,
+                base_type: "COIN",
+                sort_order: 1000,
+                base_parameters: null
+            }
+        ]
+    };
+
+    // 3. Return JSON response
+    return res.status(200).json(rewardsPayload);
+});
+
+app.post('/arena/rewards/pending/list', async (req, res) => {
+    // 1. Set required headers matching client expectations
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    try {
+        // Extract player ID from headers or request body
+        const playerId = req.headers['x-player-id'] || req.body?.player_id;
+
+        // Default: No pending rewards available
+        let pendingRewards = [];
+
+        /*
+        // Optional Database Lookup Logic:
+        if (playerId) {
+            // Retrieve unclaimed rewards for the player, if any
+            const [rows] = await pool.execute(
+                `SELECT * FROM player_pending_arena_rewards WHERE player_id = ? AND claimed = 0`,
+                [playerId]
+            );
+            
+            // Map records if pending rewards exist
+            pendingRewards = rows.map(reward => ({
+                reward_id: reward.id,
+                rewards_name: reward.rewards_name,
+                base_type: reward.base_type,
+                base_quantity: reward.base_quantity,
+                base_parameters: reward.base_parameters ? JSON.parse(reward.base_parameters) : null
+            }));
+        }
+        */
+
+        return res.status(200).json({
+            result: pendingRewards
+        });
+
+    } catch (err) {
+        console.error("Error handling /arena/rewards/pending/list:", err);
+
+        // Fallback safely to empty rewards list on error
+        return res.status(200).json({
+            result: []
+        });
+    }
+});
+
+app.post('/moving-mortys/events/list', async (req, res) => {
+    // Set headers expected by the Unity client
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    try {
+        // Return active event data or schedule for the next event
+        const responsePayload = {
+            event_data: [],
+            next_event_active: "2026-08-30T14:00:00.000Z"
+        };
+
+        return res.status(200).json(responsePayload);
+
+    } catch (err) {
+        console.error("Error handling /moving-mortys/events/list:", err);
+
+        return res.status(200).json({
+            event_data: [],
+            next_event_active: new Date().toISOString()
+        });
+    }
+});
+
+app.post('/inappdeletion/get-account-data-storage-time', (req, res) => {
+    // 1. Set required HTTP response headers
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    // 2. Return the JSON payload
+    return res.status(200).json({
+        time_anyUnits: 12
+    });
+});
+
+app.post('/lte/fyre/events/list', (req, res) => {
+    // Set standard game server response headers
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    // Return empty JSON object
+    return res.status(200).json({});
+});
+
+app.post('/event/pendingRewards', (req, res) => {
+    // Set standard game server response headers
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    // Return empty JSON object
+    return res.status(200).json({});
+});
+
+// Helper function to validate UUID v4/v1 format
+function isUuid(str) {
+    if (typeof str !== 'string') return false;
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    return uuidRegex.test(str);
+}
+
+app.post('/session/deck/edit', async (req, res) => {
+    // 1. Set response headers
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    const data = req.body;
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        return res.status(400).json({ success: false, error: "Invalid JSON" });
+    }
+
+    const sessionId = data.session_id || "";
+    const deckId = data.deck_id;
+    const list = data.owned_morty_ids;
+
+    if (!sessionId) {
+        return res.status(401).json({ success: false, error: "Not authenticated" });
+    }
+    if (typeof deckId !== 'number' || !Number.isInteger(deckId)) {
+        return res.status(400).json({ success: false, error: "deck_id must be int" });
+    }
+    if (!Array.isArray(list)) {
+        return res.status(400).json({ success: false, error: "owned_morty_ids must be array" });
+    }
+
+    try {
+        // 2. Load user by session_id
+        const [userRows] = await pool.execute(`
+            SELECT player_id, username, player_avatar_id, level, xp, streak, active_deck_id, decks_owned, xp_lower, xp_upper, tags
+            FROM users
+            WHERE session_id = ?
+            LIMIT 1
+        `, [sessionId]);
+
+        if (!userRows.length) {
+            return res.status(401).json({ success: false, error: "Invalid session" });
+        }
+
+        const user = userRows[0];
+        const playerId = user.player_id;
+        const decksOwned = parseInt(user.decks_owned || 0, 10);
+
+        if (decksOwned <= 0) {
+            return res.status(409).json({ success: false, error: "Player has no decks_owned set" });
+        }
+
+        // 3. Validate deck_id range
+        if (deckId < 0 || deckId >= decksOwned) {
+            return res.status(409).json({
+                success: false,
+                error: "Invalid deck_id",
+                deck_id: deckId,
+                decks_owned: decksOwned
+            });
+        }
+
+        // 4. Normalize list: strings only, trim, remove empties, dedupe (keep order)
+        const seen = new Set();
+        const ownedMortyIds = [];
+        for (const item of list) {
+            if (typeof item !== 'string') continue;
+            const trimmed = item.trim();
+            if (trimmed === "") continue;
+            if (seen.has(trimmed)) continue;
+            seen.add(trimmed);
+            ownedMortyIds.push(trimmed);
+        }
+
+        // 5. Max deck size validation
+        const MAX_DECK = 5;
+        if (ownedMortyIds.length > MAX_DECK) {
+            return res.status(409).json({ success: false, error: "Deck too large", max: MAX_DECK });
+        }
+
+        // 6. UUID format validation
+        const bad = [];
+        for (const id of ownedMortyIds) {
+            if (!isUuid(id)) {
+                bad.push({
+                    raw: id,
+                    len: id.length,
+                    hex: Buffer.from(id, 'utf8').toString('hex')
+                });
+            }
+        }
+
+        if (bad.length > 0) {
+            return res.status(409).json({
+                success: false,
+                error: "Invalid owned_morty_id format",
+                invalid: bad
+            });
+        }
+
+        // 7. Transactional DB Updates
+        const connection = await pool.getConnection();
+        try {
+            await connection.beginTransaction();
+
+            if (ownedMortyIds.length === 0) {
+                // Delete deck row when array is empty
+                await connection.execute(
+                    "DELETE FROM decks WHERE player_id = ? AND deck_id = ?",
+                    [playerId, deckId]
+                );
+            } else {
+                // Verify ownership in owned_morties table
+                const placeholders = ownedMortyIds.map(() => '?').join(',');
+                const queryParams = [playerId, ...ownedMortyIds];
+
+                const [foundRows] = await connection.execute(`
+                    SELECT owned_morty_id
+                    FROM owned_morties
+                    WHERE player_id = ?
+                      AND owned_morty_id IN (${placeholders})
+                `, queryParams);
+
+                const foundSet = new Set(foundRows.map(r => r.owned_morty_id));
+                const missing = ownedMortyIds.filter(id => !foundSet.has(id));
+
+                if (missing.length > 0) {
+                    await connection.rollback();
+                    connection.release();
+                    return res.status(409).json({
+                        success: false,
+                        error: "Owned morty not found for player",
+                        missing: missing
+                    });
+                }
+
+                // Prepare JSON string
+                const deckJson = JSON.stringify(ownedMortyIds);
+
+                // Check existence for Upsert logic
+                const [existsRows] = await connection.execute(
+                    "SELECT id FROM decks WHERE player_id = ? AND deck_id = ? LIMIT 1",
+                    [playerId, deckId]
+                );
+
+                if (existsRows.length > 0) {
+                    await connection.execute(
+                        "UPDATE decks SET owned_morty_ids = ? WHERE id = ?",
+                        [deckJson, existsRows[0].id]
+                    );
+                } else {
+                    await connection.execute(
+                        "INSERT INTO decks (player_id, deck_id, owned_morty_ids) VALUES (?, ?, ?)",
+                        [playerId, deckId, deckJson]
+                    );
+                }
+
+                // Update active deck on user record
+                await connection.execute(
+                    "UPDATE users SET active_deck_id = ? WHERE session_id = ?",
+                    [deckId, sessionId]
+                );
+
+                user.active_deck_id = deckId;
+            }
+
+            await connection.commit();
+            connection.release();
+        } catch (txErr) {
+            await connection.rollback();
+            connection.release();
+            throw txErr;
+        }
+
+        // 8. Reload decks for JSON response
+        const [deckRows] = await pool.execute(`
+            SELECT deck_id, owned_morty_ids
+            FROM decks
+            WHERE player_id = ?
+            ORDER BY deck_id ASC
+        `, [playerId]);
+
+        const decks = [];
+        for (const r of deckRows) {
+            let ids = [];
+            try {
+                ids = typeof r.owned_morty_ids === 'string' ? JSON.parse(r.owned_morty_ids) : (r.owned_morty_ids || []);
+            } catch (e) {
+                ids = [];
+            }
+
+            if (!Array.isArray(ids) || ids.length === 0) continue;
+
+            decks.push({
+                deck_id: parseInt(r.deck_id, 10),
+                owned_morty_ids: ids
+            });
+        }
+
+        // Decode tags
+        let tags = [];
+        if (user.tags) {
+            try {
+                const parsedTags = typeof user.tags === 'string' ? JSON.parse(user.tags) : user.tags;
+                if (Array.isArray(parsedTags)) tags = parsedTags;
+            } catch (e) {
+                tags = [];
+            }
+        }
+
+        // 9. Send response
+        return res.status(200).json({
+            player_id: playerId,
+            username: user.username,
+            player_avatar_id: user.player_avatar_id,
+            level: parseInt(user.level),
+            xp: parseInt(user.xp),
+            streak: parseInt(user.streak),
+            active_deck_id: parseInt(user.active_deck_id),
+            decks_owned: decksOwned,
+            decks: decks,
+            xp_lower: parseInt(user.xp_lower),
+            xp_upper: parseInt(user.xp_upper),
+            tags: tags
+        });
+
+    } catch (err) {
+        console.error(">>> [EDIT DECK CRITICAL ERROR]:", err);
+        return res.status(500).json({
+            success: false,
+            error: "Server error",
+            detail: err.message
+        });
+    }
+});
+
+app.post('/session/deck/set-active', async (req, res) => {
+    // 1. Set response headers
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    const data = req.body;
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        return res.status(400).json({ success: false, error: "Invalid JSON" });
+    }
+
+    const sessionId = data.session_id || "";
+    const deckId = data.deck_id;
+
+    if (!sessionId) {
+        return res.status(401).json({ success: false, error: "Not authenticated" });
+    }
+    if (typeof deckId !== 'number' || !Number.isInteger(deckId)) {
+        return res.status(400).json({ success: false, error: "deck_id must be int" });
+    }
+
+    try {
+        // 2. Load user by session_id
+        const [userRows] = await pool.execute(`
+            SELECT player_id, username, player_avatar_id, level, xp, streak, active_deck_id, decks_owned, xp_lower, xp_upper, tags
+            FROM users
+            WHERE session_id = ?
+            LIMIT 1
+        `, [sessionId]);
+
+        if (!userRows.length) {
+            return res.status(401).json({ success: false, error: "Invalid session" });
+        }
+
+        const user = userRows[0];
+        const playerId = user.player_id;
+        const decksOwned = parseInt(user.decks_owned || 0, 10);
+
+        // 3. Validate deck_id bounds against decks_owned
+        if (deckId < 0 || deckId >= decksOwned) {
+            return res.status(409).json({
+                success: false,
+                error: "Invalid deck_id",
+                deck_id: deckId,
+                decks_owned: decksOwned
+            });
+        }
+
+        // 4. Verify the target deck exists and is not empty
+        const [deckRows] = await pool.execute(`
+            SELECT owned_morty_ids
+            FROM decks
+            WHERE player_id = ? AND deck_id = ?
+            LIMIT 1
+        `, [playerId, deckId]);
+
+        if (!deckRows.length) {
+            return res.status(409).json({ success: false, error: "Deck does not exist", deck_id: deckId });
+        }
+
+        let ids = [];
+        try {
+            ids = typeof deckRows[0].owned_morty_ids === 'string' 
+                ? JSON.parse(deckRows[0].owned_morty_ids) 
+                : (deckRows[0].owned_morty_ids || []);
+        } catch (e) {
+            ids = [];
+        }
+
+        if (!Array.isArray(ids) || ids.length === 0) {
+            return res.status(409).json({ success: false, error: "Cannot activate empty deck", deck_id: deckId });
+        }
+
+        // 5. Update user's active deck
+        await pool.execute(
+            "UPDATE users SET active_deck_id = ? WHERE session_id = ?",
+            [deckId, sessionId]
+        );
+
+        user.active_deck_id = deckId;
+
+        // 6. Build non-empty decks list for final payload
+        const [allDeckRows] = await pool.execute(`
+            SELECT deck_id, owned_morty_ids
+            FROM decks
+            WHERE player_id = ?
+            ORDER BY deck_id ASC
+        `, [playerId]);
+
+        const decks = [];
+        for (const r of allDeckRows) {
+            let list = [];
+            try {
+                list = typeof r.owned_morty_ids === 'string' ? JSON.parse(r.owned_morty_ids) : (r.owned_morty_ids || []);
+            } catch (e) {
+                list = [];
+            }
+
+            if (!Array.isArray(list) || list.length === 0) continue;
+
+            decks.push({
+                deck_id: parseInt(r.deck_id, 10),
+                owned_morty_ids: list
+            });
+        }
+
+        // 7. Decode tags safely
+        let tags = [];
+        if (user.tags) {
+            try {
+                const parsedTags = typeof user.tags === 'string' ? JSON.parse(user.tags) : user.tags;
+                if (Array.isArray(parsedTags)) tags = parsedTags;
+            } catch (e) {
+                tags = [];
+            }
+        }
+
+        // 8. Return response object
+        return res.status(200).json({
+            player_id: playerId,
+            username: user.username,
+            player_avatar_id: user.player_avatar_id,
+            level: parseInt(user.level, 10),
+            xp: parseInt(user.xp, 10),
+            streak: parseInt(user.streak, 10),
+            active_deck_id: parseInt(user.active_deck_id, 10),
+            decks_owned: decksOwned,
+            decks: decks,
+            xp_lower: parseInt(user.xp_lower || 0, 10),
+            xp_upper: parseInt(user.xp_upper || 0, 10),
+            tags: tags
+        });
+
+    } catch (err) {
+        console.error(">>> [SET ACTIVE DECK CRITICAL ERROR]:", err);
+        return res.status(500).json({
+            success: false,
+            error: "Server error",
+            detail: err.message
+        });
+    }
+});
+
+
+app.post('/session/incentive/reject', async (req, res) => {
+    // Match the headers from your PHP script
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    const session_id = req.body.session_id ? String(req.body.session_id) : '';
+
+    // Validation check
+    if (session_id === '') {
+        return res.status(400).json({
+            error: { code: "BAD_REQUEST" }
+        });
+    }
+
+    try {
+        // 1. Validate user via session
+        const user = await requireUserBySession(session_id);
+        const player_id = user.player_id;
+
+        // 4. Success payload response
+        return res.json({
+            item_id: "ItemMrMeeseek"
+        });
+
+    } catch (err) {
+        // Handle unauthorized exceptions thrown from helper methods
+        if (err.statusCode === 401) {
+            return res.status(401).json({
+                error: { code: "NOT_AUTHENTICATED" }
+            });
+        }
+        
+        console.error("[Item API] Internal server error:", err.message);
+        return res.status(500).json({
+            error: { code: "SERVER_ERROR" }
+        });
+    }
+
+});
+
+
 
 
 
@@ -5188,99 +7429,80 @@ const opponentPayload = {
 
 
 // UDP SERVER
-const udpPlayers = new Map();
+const udpPlayers = new Map();       // sessionHex -> player object
+const playersByRoom = new Map();    // roomId -> Map<sessionHex, player>
 
-// sessionHex -> {
-//   playerId,
-//   address,
-//   port,
-//   x,
-//   y,
-//   frame,
-//   direction,
-//   xFlags,
-//   yFlags,
-//   sequence,
-//   lastSeen
-// }
-
-
-function hexToUuid(hex){
+function hexToUuid(hex) {
     return (
-        hex.substring(0,8)+"-"+
-        hex.substring(8,12)+"-"+
-        hex.substring(12,16)+"-"+
-        hex.substring(16,20)+"-"+
-        hex.substring(20,32)
+        hex.substring(0, 8) + "-" +
+        hex.substring(8, 12) + "-" +
+        hex.substring(12, 16) + "-" +
+        hex.substring(16, 20) + "-" +
+        hex.substring(20, 32)
     );
 }
 
-
 function registerPlayerUdpSession(playerId, sessionHex, roomId) {
-    udpPlayers.set(sessionHex, {
+    // Precompute the 16-byte identity buffer ONCE — never redo this per-packet.
+    const idHex = playerId.replace(/-/g, "");
+    const idBuffer = Buffer.from(idHex, "hex");
+
+    if (idBuffer.length !== 16) {
+        console.error(`[UDP REGISTER ERROR] bad playerId "${playerId}" -> ${idBuffer.length} bytes, expected 16`);
+        return;
+    }
+
+    const player = {
         playerId,
+        idBuffer,        // precomputed, reused on every relay
         roomId,
         address: null,
         port: null,
         lastSeen: Date.now()
-    });
-}
-
-function decodePacket(buffer){
-
-    if(buffer.length !== 24){
-        throw new Error(
-            `Invalid packet size ${buffer.length}`
-        );
-    }
-
-
-    return {
-
-        session:
-            buffer.subarray(0,16).toString("hex"),
-
-        sequence:
-            buffer.readUInt16LE(16),
-
-        x:
-            buffer.readUInt8(18),
-
-        xFlags:
-            buffer.readUInt8(19),
-
-        y:
-            buffer.readUInt8(20),
-
-        yFlags:
-            buffer.readUInt8(21),
-
-        frame:
-            buffer.readUInt8(22),
-
-        direction:
-            buffer.readUInt8(23)
     };
 
+    udpPlayers.set(sessionHex, player);
+
+    // Room index so relay loops never touch other rooms' players
+    if (!playersByRoom.has(roomId)) {
+        playersByRoom.set(roomId, new Map());
+    }
+    playersByRoom.get(roomId).set(sessionHex, player);
 }
 
-function relayMovement(senderPlayerId, target, msg) {
-    const idHex = senderPlayerId.replace(/-/g, "");
-    const idBuffer = Buffer.from(idHex, "hex");
-
-    if (idBuffer.length !== 16) {
-        console.error(`[UDP RELAY ERROR] bad playerId "${senderPlayerId}" -> ${idBuffer.length} bytes, expected 16`);
-        return;
+function unregisterPlayerUdpSession(sessionHex) {
+    const player = udpPlayers.get(sessionHex);
+    if (!player) return;
+    udpPlayers.delete(sessionHex);
+    const room = playersByRoom.get(player.roomId);
+    if (room) {
+        room.delete(sessionHex);
+        if (room.size === 0) playersByRoom.delete(player.roomId);
     }
+}
 
+function decodePacket(buffer) {
+    if (buffer.length !== 24) {
+        throw new Error(`Invalid packet size ${buffer.length}`);
+    }
+    return {
+        session: buffer.subarray(0, 16).toString("hex"),
+        sequence: buffer.readUInt16LE(16),
+        x: buffer.readUInt8(18),
+        xFlags: buffer.readUInt8(19),
+        y: buffer.readUInt8(20),
+        yFlags: buffer.readUInt8(21),
+        frame: buffer.readUInt8(22),
+        direction: buffer.readUInt8(23)
+    };
+}
+
+function relayMovement(idBuffer, target, msg) {
     const relayPacket = Buffer.concat([idBuffer, msg.subarray(16)]);
-
     udpServer.send(relayPacket, 0, relayPacket.length, target.port, target.address);
-    //console.log("[UDP RELAY]", senderPlayerId, "->", target.playerId, relayPacket.toString("hex"));
 }
 
 udpServer.on('message', (msg, rinfo) => {
-    //console.log("[RELAY RAW]", msg.toString("hex"));
     try {
         const packet = decodePacket(msg);
         const player = udpPlayers.get(packet.session);
@@ -5291,10 +7513,8 @@ udpServer.on('message', (msg, rinfo) => {
 
         player.address = rinfo.address;
         player.port = rinfo.port;
-        player.lastPacket = Buffer.from(msg);
         player.lastSeen = Date.now();
-		
-		// --- NEW: keep the live position map in sync ---
+
         livePlayerPositions.set(player.playerId, {
             x: packet.x,
             y: packet.y,
@@ -5304,34 +7524,24 @@ udpServer.on('message', (msg, rinfo) => {
             lastUpdated: Date.now()
         });
 
-        //console.log(`[UDP MOVE] Player:${player.playerId} - Pos:${packet.x},${packet.y} - Seq:${packet.sequence} - Frame:${packet.frame} - Dir:${packet.direction}`);
+        // Only scan players in the SAME room, not the whole server
+        const roomPlayers = playersByRoom.get(player.roomId);
+        if (!roomPlayers) return;
 
-// in the relay loop:
-for (const [targetSession, target] of udpPlayers) {
-    if (targetSession === packet.session) continue;
-    if (!target.address) continue;
-    if (target.roomId !== player.roomId) continue; // room isolation
-    relayMovement(player.playerId, target, msg);
-}
-
-
+        for (const target of roomPlayers.values()) {
+            if (target === player) continue;
+            if (!target.address) continue;
+            relayMovement(player.idBuffer, target, msg);
+        }
     } catch (err) {
         console.error("[UDP ERROR]", err);
     }
 });
 
-
-
-
-
-udpServer.bind(
-13001,
-'0.0.0.0',
-()=>{
-
-console.log("UDP Movement Engine listening on 13001");
-
+udpServer.bind(13001, '0.0.0.0', () => {
+    console.log("UDP Movement Engine listening on 13001");
 });
+
 
 
 

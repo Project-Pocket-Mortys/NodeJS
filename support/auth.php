@@ -1,6 +1,6 @@
 <?php
 declare(strict_types=1);
-require __DIR__ . "/../pocket_f4894h398r8h9w9er8he98he.php";   // IMPORTANT: make sure filename matches
+require __DIR__ . "../../pocket_f4894h398r8h9w9er8he98he.php";   // IMPORTANT: make sure filename matches
 
 if (session_status() !== PHP_SESSION_ACTIVE) {
   session_start();
@@ -17,7 +17,7 @@ function require_user(PDO $pdo): array {
   // 2) Token from session OR cookie
   $token = $_SESSION["token"] ?? ($_COOKIE[$COOKIE_NAME] ?? "");
   if (!$token) {
-    header("Location: /support/");
+    header("Location: /");
     exit;
   }
 
