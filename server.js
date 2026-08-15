@@ -6,7 +6,8 @@ const jwt = require('jsonwebtoken');
 const dgram = require('dgram');
 const udpServer = dgram.createSocket('udp4');
 const livePlayerPositions = new Map();
-const activeSseConnections = new Map();
+const activeSseConnections = new Map();      // player_id -> sseSend
+const activeRoomSseConnections = new Map();  // room_id -> Set of sseSend
 const SpawnedMorties = new Map();
 const SpawnedItems = new Map();
 const SpawnedBots = new Map();
@@ -21,10 +22,10 @@ const toBool = (val) => val === true || val === 1 || String(val).toLowerCase() =
 
 // ---------------- 1. DATABASE CONFIGURATION ----------------
 const pool = mysql.createPool({
-    host: 'localhost',
-    user: 'yourusername',
-    password: 'yourpassword',
-    database: 'yourdatabase',
+    host: '192.168.1.142',
+    user: 'pocketmortymans',
+    password: '_YtGgA5J@!9Vk*va',
+    database: 'pocket_mortys',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
@@ -369,7 +370,93 @@ setInterval(async () => {
 
             console.log(`[Timeout!] Player ${player_id} has timed out from room ${room_id}.`);
 
-            // 2. Remove the player's room mapping and state fields in the database
+// ============================================================
+// RETURN ANY WILD MORTIES BELONGING TO THIS TIMED-OUT PLAYER
+// ============================================================
+
+if (typeof Battles !== 'undefined' && Battles instanceof Map) {
+
+    for (const battle of Battles.keys()) {
+
+        // Battles stores the entire battle object as the Map key
+        if (!battle || typeof battle !== 'object') {
+            continue;
+        }
+
+        // Only Wild Morty battles
+        if (String(battle.battle_type || "") !== "PvWM") {
+            continue;
+        }
+
+        const battlePlayerId = String(
+            battle.meta?.player_id || ""
+        );
+
+        // This battle does not belong to the timed-out player
+        if (battlePlayerId !== player_id) {
+            continue;
+        }
+
+        const battleRoomId = String(
+            battle.meta?.room_id || room_id
+        );
+
+        const wildMortyId = String(
+            battle.meta?.wild_morty_id || ""
+        );
+
+        console.log(`[Timeout!] Player ${player_id} had Wild Morty ${wildMortyId} ` + `in battle ${battle.battle_id}. Returning Morty to WORLD.`);
+
+        // Get the Morties currently spawned in that room
+        const roomMorties = SpawnedMorties.get(battleRoomId);
+
+        if (roomMorties && wildMortyId) {
+
+            const wildPayload = roomMorties.find(
+                m => String(m.wild_morty_id) === wildMortyId
+            );
+
+            if (wildPayload) {
+
+                // Return the Morty to the WORLD state
+                wildPayload.state = "WORLD";
+                wildPayload._updated = new Date().toISOString();
+
+                SpawnedMorties.set(battleRoomId, roomMorties);
+
+                // Notify everyone currently in the room
+                await publishEvent(
+                    battleRoomId,
+                    "room:wild-morty-state-changed",
+                    {
+                        wild_morty_id: wildMortyId,
+                        state: "WORLD"
+                    }
+                );
+
+                console.log(`[Timeout!] Wild Morty ${wildMortyId} returned to WORLD ` + `in room ${battleRoomId}.`);
+
+            } else {
+
+                console.warn(
+                    `[Timeout!] Wild Morty ${wildMortyId} was not found ` +
+                    `in room ${battleRoomId}.`
+                );
+            }
+        }
+
+        // Remove this battle from the Battles Map.
+        // Because the battle object itself is the key:
+        Battles.delete(battle);
+
+        console.log(`[Timeout!] Removed abandoned PvWM battle ${battle.battle_id}.`);
+    }
+}
+
+            // ============================================================
+            // 2. REMOVE THE PLAYER'S ROOM MAPPING / STATE
+            // ============================================================
+
             await pool.execute(`
                 UPDATE users 
                 SET room_id = '', 
@@ -377,15 +464,32 @@ setInterval(async () => {
                 WHERE player_id = ?
             `, [player_id]);
 
-            // 3. Broadcast the 'room:user-removed' event via your SSE event queue pipeline
-            // This alerts every other client in that map to instantly destroy the player's avatar
-			await publishEvent(String(room_id), "room:user-removed", { room_id: String(room_id), player_id: String(player_id) }, player_id);
-			
-            // 4. Optional: Clean up their streaming references if they are still tracked in memory
-            if (typeof activeSseConnections !== 'undefined' && activeSseConnections.has(player_id)) {
+            // ============================================================
+            // 3. TELL OTHER PLAYERS THAT THIS PLAYER LEFT
+            // ============================================================
+
+            await publishEvent(
+                String(room_id),
+                "room:user-removed",
+                {
+                    room_id: String(room_id),
+                    player_id: String(player_id)
+                },
+                player_id
+            );
+
+            // ============================================================
+            // 4. CLEAN UP SSE CONNECTION
+            // ============================================================
+
+            if (
+                typeof activeSseConnections !== 'undefined' &&
+                activeSseConnections.has(player_id)
+            ) {
                 activeSseConnections.delete(player_id);
             }
         }
+
     } catch (err) {
         console.error("[Timeout Worker Error]:", err.message);
     }
@@ -513,166 +617,63 @@ async function getActiveDeckMorties(playerId) {
     return ordered;
 }
 
-function broadcastSSE(eventName, payload) {
+function broadcastRoomSSE(roomId, eventName, payload, excludePlayerId = null) {
     const data = typeof payload === "string"
         ? payload
         : JSON.stringify(payload);
 
-    for (const [player_id, sseSend] of activeSseConnections) {
+    const roomConnections = activeRoomSseConnections.get(String(roomId));
+
+    if (!roomConnections) {
+        return;
+    }
+
+    for (const sseSend of roomConnections) {
+        // Find which player owns this SSE connection
+        let connectionPlayerId = null;
+
+        for (const [playerId, connection] of activeSseConnections) {
+            if (connection === sseSend) {
+                connectionPlayerId = playerId;
+                break;
+            }
+        }
+
+        // Don't send the event to the player who triggered it
+        if (
+            excludePlayerId !== null &&
+            String(connectionPlayerId) === String(excludePlayerId)
+        ) {
+            continue;
+        }
+
         try {
             sseSend(eventName, data);
         } catch (err) {
-            console.error(`SSE failed for ${player_id}:`, err);
+            console.error(`SSE failed for ${connectionPlayerId}:`, err);
         }
     }
 }
 
-// ---------------- 4. CORE COMPREHENSIVE EVENT PUBLISHER (From events.php) ----------------
+function sendPrivateSSE(playerId, eventName, payload) {
+    const sseSend = activeSseConnections.get(String(playerId));
 
-async function publishEvent(roomId, event, payload, playerId = null) {
-    let pickup_id = null;
-    let placement = null;
-    let wild_morty_id = null;
-    let morty_id = null;
-    let state = null;
-    let division = null;
-    let variant = null;
-    let shiny_if_potion = 0;
-    let pick_up_contents = null;
-    const zone_id = "[1,1]";
-    let bot_id = null;
-    let username = null;
-    let player_avatar_id = null;
-	let level = 1;
-    let owned_morties = null;
-    let battle_start = null;
-    let get_current_raid = null;
-    let battle_turn_result = null;
-    let battle_move_timer_started = null;
-	let battle_invite_recieved = null;
-    let emote = null;
-    let only_show_to_player_id = null;
-
-    // Globally capture placement arrays across all incoming types
-    if (payload && payload.placement && Array.isArray(payload.placement)) {
-        placement = `${payload.placement[0]},${payload.placement[1]}`;
+    if (!sseSend) {
+        return false;
     }
 
-    if (event === "room:pickup-added") {
-        pickup_id = payload.pickup_id || null;
-        pick_up_contents = payload.contents ? JSON.stringify(payload.contents) : JSON.stringify([]);
-    }
-    
-    if (event === "room:pickup-removed") {
-        pickup_id = payload.pickup_id || null;
-    }
+    const data = typeof payload === "string"
+        ? payload
+        : JSON.stringify(payload);
 
-    if (event === "room:wild-morty-added") {
-        wild_morty_id = payload.wild_morty_id || null;
-        morty_id = payload.morty_id || null;
-        state = payload.state || "WORLD";
-        division = payload.division || null;
-        variant = payload.variant || null;
-        shiny_if_potion = payload.shiny_if_potion ? 1 : 0;
+    try {
+        sseSend(eventName, data);
+        return true;
+    } catch (err) {
+        console.error(`Private SSE failed for ${playerId}:`, err);
+        return false;
     }
-
-    if (event === "room:bot-added") {
-        bot_id = payload.bot_id || null;
-        username = payload.username || null;
-        player_avatar_id = payload.player_avatar_id || null;
-        state = payload.state || "WORLD";
-        owned_morties = payload.owned_morties ? JSON.stringify(payload.owned_morties) : JSON.stringify([]);
-    }
-
-    //if (event === "shard:raid-boss-state-changed") {
-        //get_current_raid = JSON.stringify(payload);
-		//console.log(get_current_raid);
-    //}
-
-    if (event === "room:user-added") {
-        roomId = payload.room_id || null;
-        playerId = payload.player_id || null;
-        state = payload.state || null;
-        username = payload.username || null;
-		level = payload.level || null;
-        player_avatar_id = payload.player_avatar_id || null;
-		placement = payload.placement || null;
-    }
-
-    if (event === "room:user-removed") {
-		roomId = payload.room_id || null;
-        playerId = payload.player_id || null;
-    }
-
-    if (event === "room:wild-morty-state-changed") {
-        wild_morty_id = payload.wild_morty_id || null;
-        state = payload.state || null;
-    }
-	
-    if (event === "room:bot-state-changed") {
-        bot_id = payload.bot__id || null;
-        state = payload.state || null;
-    }
-
-    if (event === "room:user-state-changed") {
-        playerId = payload.player_id || null;
-        state = payload.state || null;
-    }
-
-    if (event === "battle:start") {
-        battle_start = JSON.stringify(payload);
-        only_show_to_player_id = playerId;
-    }
-	
-	if (event === "battle-invite:received") {
-        battle_invite_recieved = JSON.stringify(payload);
-        only_show_to_player_id = playerId;
-    }
-
-    if (event === "battle:turn-result") {
-        battle_turn_result = JSON.stringify(payload);
-    }
-
-    if (event === "battle:move-timer-started") {
-        battle_move_timer_started = JSON.stringify(payload);
-    }
-
-    if (event === "emote:room") {
-        playerId = payload.player_id || null;
-        emote = payload.emote || null;
-    }
-	
-    if (event === "room:user-modified") {
-        playerId = payload.player_id || null;
-        state = payload.state || null;
-        username = payload.username || null;
-		level = payload.level || null;
-        player_avatar_id = payload.player_avatar_id
-    }
-	
-	if (event === "room:wild-morty-removed") {
-        wild_morty_id = payload.wild_morty_id;
-    }
-
-    const query = `
-        INSERT INTO event_queue (
-            room_id, event_name, player_id, emote, current_raid, battle_start, 
-            battle_turn_result, battle_move_timer_started, battle_invite_recieved, bot_id, username, 
-            player_avatar_id, player_level, wild_morty_id, morty_id, placement, state, 
-            division, zone_id, variant, shiny_if_potion, pickup_id, 
-            pick_up_contents, owned_morties, only_show_to_player_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-
-    await pool.execute(query, [
-        roomId, event, playerId, emote, get_current_raid, battle_start,
-        battle_turn_result, battle_move_timer_started, battle_invite_recieved, bot_id, username,
-        player_avatar_id, level, wild_morty_id, morty_id, placement, state,
-        division, zone_id, variant, shiny_if_potion, pickup_id,
-        pick_up_contents, owned_morties, only_show_to_player_id
-    ]);
 }
-
-// -------------------- 5. GAME COMPLIANCE CONFIG ROUTES --------------------
 
 app.post('/trading/config', (req, res) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -927,9 +928,20 @@ app.get('/sse', async (req, res) => {
     let connectionActive = true;
 
     // --- 2. CLEAN UP REGISTRY MAP ON CLOSE ---
-    req.on('close', () => { 
-        connectionActive = false; 
+    req.on('close', () => {
+        connectionActive = false;
+
         activeSseConnections.delete(player_id);
+
+        const roomConnections = activeRoomSseConnections.get(room_id);
+
+        if (roomConnections) {
+            roomConnections.delete(sseSend);
+
+            if (roomConnections.size === 0) {
+                activeRoomSseConnections.delete(room_id);
+            }
+        }
     });
 
     // Room entry wait-stage loop
@@ -943,6 +955,11 @@ app.get('/sse', async (req, res) => {
     }
 
     if (!connectionActive || room_id === "" || room_id === "0") return res.end();
+	
+	if (!activeRoomSseConnections.has(room_id)) {
+        activeRoomSseConnections.set(room_id, new Set());
+    }
+    activeRoomSseConnections.get(room_id).add(sseSend);
 
     let clientLastEventId = null;
     if (req.headers['last-event-id'] && /^\d+$/.test(req.headers['last-event-id'])) {
@@ -1010,165 +1027,8 @@ app.get('/sse', async (req, res) => {
     } else {
         last_id = clientLastEventId;
     }
-
-    const privateEvents = ["battle:start", "battle:move-timer-started", "battle:turn-result", "battle-invite:received"];
-
     // Core Event Streaming Loop
     while (connectionActive) {
-        const [events] = await pool.execute(
-            `SELECT id, room_id, event_name, player_id, emote, current_raid, battle_start, battle_turn_result, 
-                    battle_move_timer_started, battle_invite_recieved, bot_id, username, player_avatar_id, player_level, wild_morty_id, morty_id, 
-                    placement, state, division, zone_id, variant, shiny_if_potion, pickup_id, pick_up_contents, 
-                    owned_morties, only_show_to_player_id 
-             FROM event_queue WHERE room_id = ? AND id > ? ORDER BY id ASC LIMIT 200`,
-            [room_id, last_id]
-        );
-
-        for (const row of events) {
-            const eventName = String(row.event_name);
-            const eid = parseInt(row.id, 10);
-            const targetPid = String(row.player_id || "");
-            let payload = null;
-
-            if (privateEvents.includes(eventName)) {
-                if (targetPid !== "" && targetPid !== player_id) {
-                    last_id = eid;
-                    continue;
-                }
-                const fallBackPayload = row.battle_start || row.battle_turn_result || row.battle_move_timer_started || "{}";
-                if (targetPid === "" && !payloadInvolvesPlayer(fallBackPayload, player_id)) {
-                    last_id = eid;
-                    continue;
-                }
-            }
-
-            const coords = String(row.placement || "0,0").split(",");
-            const placementArr = [parseInt(coords[0] || 0, 10), parseInt(coords[1] || 0, 10)];
-
-            switch (eventName) {
-                case "room:pickup-added": {
-					const placementArr = JSON.parse(row.placement);
-                    payload = JSON.stringify({
-                        pickup_id: row.pickup_id,
-                        placement: placementArr,
-                        contents: JSON.parse(row.pick_up_contents || "[]")
-                    });
-                    break;
-                }
-                case "room:wild-morty-added": {
-                    payload = JSON.stringify({
-                        morty_id: row.morty_id,
-                        placement: placementArr,
-                        state: row.state || "WORLD",
-                        division: parseInt(row.division || 1, 10),
-                        variant: row.variant || "Normal",
-                        shiny_if_potion: Boolean(row.shiny_if_potion),
-                        _created: new Date().toISOString(),
-                        _updated: new Date().toISOString(),
-                        wild_morty_id: row.wild_morty_id
-                    });
-                    break;
-                }
-                case "room:wild-morty-removed": {
-                    payload = JSON.stringify({
-                        wild_morty_id: row.wild_morty_id
-                    });
-                    break;
-                }
-                case "room:bot-added": {
-                    payload = JSON.stringify({
-                        username: row.username,
-                        player_avatar_id: row.player_avatar_id,
-                        state: row.state || "WORLD",
-                        level: 1,
-                        owned_morties: JSON.parse(row.owned_morties || "[]"),
-                        streak: 0,
-                        bot_id: row.bot_id,
-                        placement: placementArr
-                    });
-                    break;
-                }
-                case "room:bot-state-changed": {
-                    payload = JSON.stringify({ bot_id: row.bot_id, state: row.state });
-                    break;
-                }
-                case "room:wild-morty-state-changed": {
-                    payload = JSON.stringify({ wild_morty_id: row.wild_morty_id, state: row.state });
-                    break;
-                }
-                case "room:user-state-changed": {
-                    payload = JSON.stringify({ 
-                        player_id: String(row.player_id), 
-                        state: String(row.state || "WORLD")
-                    });
-                    break;
-                }
-                case "battle:start": {
-                    payload = String(row.battle_start || "");
-                    break;
-                }
-                case "battle:turn-result": {
-                    payload = String(row.battle_turn_result || "");
-                    break;
-                }
-                case "battle:move-timer-started": {
-                    payload = String(row.battle_move_timer_started || "");
-                    break;
-                }
-                case "room:pickup-removed": {
-                    payload = JSON.stringify({ pickup_id: row.pickup_id });
-                    break;
-                }
-                case "emote:room": {
-                    payload = JSON.stringify({ player_id: row.player_id, emote: row.emote });
-                    break;
-                }
-                case "room:user-added": {
-                    if (player_id === row.player_id) {
-                        last_id = eid;
-                        continue;
-                    }
-                    const activeDeck = await getActiveDeckMorties(row.player_id);
-                    const playerPlacement = JSON.parse(row.placement || "[0,0]");
-                    payload = JSON.stringify({
-                        player_id: row.player_id,
-                        username: String(row.username || ""),
-                        player_avatar_id: String(row.player_avatar_id || ""),
-                        level: row.player_level,
-                        owned_morties: activeDeck,
-                        state: row.state || "WORLD",
-                        placement: playerPlacement
-                    });
-                    break;
-                }
-                case "room:user-removed": {
-                    payload = JSON.stringify({ player_id: row.player_id });
-                    break;
-                }
-                case "room:user-modified": {
-                    const activeDeck = await getActiveDeckMorties(row.player_id);
-                    payload = JSON.stringify({
-                        player_id: row.player_id,
-                        username: row.username,
-                        player_avatar_id: row.player_avatar_id,
-                        level: row.level,
-                        owned_morties: activeDeck,
-                        state: row.state
-                    });
-                    break;
-                }
-                case "battle-invite:received": {
-                    payload = String(row.battle_invite_recieved || "");
-                    break;
-                }
-                default:
-                    payload = "{}";
-            }
-
-            sseSend(eventName, payload, eid);
-            last_id = eid;
-        }
-        
         await new Promise(resolve => setTimeout(resolve, 100)); // 10 ticks per second
     }
 
@@ -2116,11 +1976,6 @@ app.post('/session/join-room', async (req, res) => {
             [room_id, player_id]
         );
 
-        const [baselineRows] = await pool.execute(`SELECT COALESCE(MAX(id), 0) AS max_id FROM event_queue WHERE room_id = ?`, [room_id]);
-        const baseline_event_id = parseInt(baselineRows[0].max_id, 10);
-        
-        //await pool.execute(`UPDATE users SET last_event_id = ? WHERE player_id = ?`, [baseline_event_id, player_id]);
-
         const [roomUsers] = await pool.execute(
             `SELECT player_id, username, player_avatar_id, level, state, active_deck_id 
              FROM users WHERE room_id = ? AND last_seen >= (NOW() - INTERVAL 1 MINUTE)`,
@@ -2208,9 +2063,6 @@ app.post('/session/join-room', async (req, res) => {
                 level: u.level,
                 owned_morties: owned_morties,
                 state: u.state
-				//"shiny_if_potion": false,
-		        //"streak": u.streak,
-				//placement: currentPlacement // Handled and overwritten immediately by the active UDP server loop
             });
         }
 
@@ -2239,45 +2091,61 @@ app.post('/session/join-room', async (req, res) => {
             bots: bots
         };
 		
-        //await pool.execute(
-        //    `UPDATE users SET room_id = ?, state = 'WORLD', last_seen = NOW() WHERE player_id = ?`,
-        //    [room_id, player_id]
-        //);
-		
-		// --- BROADCAST PLAYER JOINED NOW THAT SSE PIPELINE IS ESTABLISHED ---
-        const [uRows] = await pool.execute("SELECT username, player_avatar_id, level, state FROM users WHERE player_id = ?", [player_id]);
-        if (uRows.length) {
-			let currentPlacement;
+// --- BROADCAST PLAYER JOINED TO OTHER PLAYERS IN THE ROOM ---
 
-            if (world_id_in == 1){
-                currentPlacement = [30, 35];
-            } else if (world_id_in == 2){
-                currentPlacement = [21, 72];
-            } else if (world_id_in == 3){
-                currentPlacement = [31, 50];
-            } else if (world_id_in == 4){
-                currentPlacement = [31, 74];
-            } else if (world_id_in == 5){
-                currentPlacement = [34, 14];
-            } else if (world_id_in == 6){
-                currentPlacement = [49, 12];
-            } else if (world_id_in == 7){
-                currentPlacement = [40, 84];
-			}
-			
-            const publishPayload = {
-                room_id: room_id,
-                player_id: player_id,
-                username: uRows[0].username,
-                player_avatar_id: uRows[0].player_avatar_id,
-				level: uRows[0].level,
-                state: uRows[0].state,
-				"shiny_if_potion": false,
-		        "streak": uRows[0].streak,
-                placement: currentPlacement
-            };
-            publishEvent(room_id, "room:user-added", publishPayload, player_id).catch(console.error);
-        }
+const joiningUser = users.find(
+    u => String(u.player_id) === String(player_id)
+);
+
+if (joiningUser) {
+    let currentPlacement;
+
+    if (world_id_in == 1) {
+        currentPlacement = [30, 35];
+    } else if (world_id_in == 2) {
+        currentPlacement = [21, 72];
+    } else if (world_id_in == 3) {
+        currentPlacement = [31, 50];
+    } else if (world_id_in == 4) {
+        currentPlacement = [31, 74];
+    } else if (world_id_in == 5) {
+        currentPlacement = [34, 15];
+    } else if (world_id_in == 6) {
+        currentPlacement = [49, 12];
+    } else if (world_id_in == 7) {
+        currentPlacement = [40, 84];
+    }
+
+    // Get the joining player's current UDP position if available
+    const livePos = livePlayerPositions.get(String(player_id));
+
+    if (livePos) {
+        currentPlacement = [
+            livePos.x,
+            livePos.y
+        ];
+    }
+
+    const publishPayload = {
+        room_id: room_id,
+        player_id: joiningUser.player_id,
+        username: joiningUser.username,
+        player_avatar_id: joiningUser.player_avatar_id,
+        level: joiningUser.level,
+        owned_morties: joiningUser.owned_morties,
+        state: joiningUser.state || "WORLD",
+        shiny_if_potion: false,
+        streak: 0,
+        placement: currentPlacement
+    };
+
+    broadcastRoomSSE(
+        room_id,
+        "room:user-added",
+        publishPayload,
+        player_id
+    );
+}
 
         return res.json(responseData);
 
@@ -3336,7 +3204,11 @@ app.post('/session/battle-wild-morty', async (req, res) => {
             battle_type: "PvWM",
             player: playerPayload,
             opponent: opponentPayload,
-            meta: {}
+            meta: {
+            player_id: playerId,
+            room_id: roomId,
+            wild_morty_id: wildMortyIdInput
+            }
         };
         
         const payloadStr = JSON.stringify(finalBroadcastPayload);
@@ -4009,22 +3881,22 @@ app.post('/session/battle/move', async (req, res) => {
 
 
             if (outcome === "WIN") {
-                await publishEvent(roomId, "battle:turn-result", {
+                sendPrivateSSE(playerId, "battle:turn-result", {
                     battle_id: battleId,
                     outcome: "WIN",
                     turn_datas: turnDatas,
                     player_datas: {
                         player: {
-                            "player_xp_datas": {
-                                "streak": 0,
-                                "streak_old": 0,
-                                "xp_earned": 60,
-                                "xp_multiplier": 0,
-                                "player_datas": [{
-                                    "level": 1,
-                                    "xp": 60,
-                                    "xp_lower": 0,
-                                    "xp_upper": 64
+                            player_xp_datas: {
+                                streak: 0,
+                                streak_old: 0,
+                                xp_earned: 60,
+                                xp_multiplier: 0,
+                                player_datas: [{
+                                    level: 1,
+                                    xp: 60,
+                                    xp_lower: 0,
+                                    xp_upper: 64
                                 }]
                             },
                             xp_datas: xpDatas,
@@ -4047,11 +3919,11 @@ app.post('/session/battle/move', async (req, res) => {
                                     ITEM: 1
                                 },
                                 last_move_type: type
-                            },
+                            }
                         },
                         opponent: {}
                     }
-                }, playerId);
+                });
 
 				const key = String(roomId);
                 let roomMorties = SpawnedMorties.get(key) || [];
@@ -4089,14 +3961,10 @@ app.post('/session/battle/move', async (req, res) => {
                 // 4. Update SpawnedMorties Map
                 roomMorties.push(newWildMorty);
                 SpawnedMorties.set(key, roomMorties);
-
-                // 5. Broadcast despawn & spawn events to the room
-                await publishEvent(roomId, "room:wild-morty-removed", { 
-                    wild_morty_id: wildOwnedMortyId 
-                });
-
-                await publishEvent(roomId, "room:wild-morty-added", { wild_morty: newWildMorty });
-                await publishEvent(roomId, "room:user-state-changed", { player_id: playerId, state: "WORLD" });
+				
+				broadcastRoomSSE(roomId, "room:wild-morty-removed", { wild_morty_id: wildOwnedMortyId });
+				broadcastRoomSSE(roomId, "room:wild-morty-added", { wild_morty: newWildMorty });
+				broadcastRoomSSE(roomId, "room:user-state-changed", { player_id: playerId, state: "WORLD" });
             }
 
             // Post-Turn Cleanups for absolute resolution shifts (Lose / Caught)
@@ -4105,11 +3973,11 @@ app.post('/session/battle/move', async (req, res) => {
                 wildPayload.state = "WORLD";
                 wildPayload._updated = new Date().toISOString();
 				
-                await publishEvent(roomId, "room:wild-morty-state-changed", {
+                await broadcastRoomSSE(roomId, "room:wild-morty-state-changed", {
                     wild_morty_id: wildOwnedMortyId,
                     state: "WORLD"
                 });
-                await publishEvent(roomId, "room:user-state-changed", {
+                await broadcastRoomSSE(roomId, "room:user-state-changed", {
                     player_id: playerId,
                     state: "WORLD"
                 });
@@ -5635,8 +5503,8 @@ const opponentOwnedMorties = morties.map((m) => ({
         const placeholders = ownedMortyIds.map(() => '?').join(',');
         
         const [attackRows] = await pool.execute(`
-            SELECT owned_morty_id, attack_id, position, pp, pp_stat 
-            FROM owned_attacks 
+            SELECT owned_morty_id, attacks_array
+            FROM owned_morties 
             WHERE owned_morty_id IN (${placeholders}) 
             ORDER BY owned_morty_id ASC, position ASC
         `, ownedMortyIds);
