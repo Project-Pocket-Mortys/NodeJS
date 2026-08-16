@@ -425,7 +425,7 @@ if (typeof Battles !== 'undefined' && Battles instanceof Map) {
                 SpawnedMorties.set(battleRoomId, roomMorties);
 
                 // Notify everyone currently in the room
-                await publishEvent(
+                await broadcastRoomSSE(
                     battleRoomId,
                     "room:wild-morty-state-changed",
                     {
@@ -468,7 +468,7 @@ if (typeof Battles !== 'undefined' && Battles instanceof Map) {
             // 3. TELL OTHER PLAYERS THAT THIS PLAYER LEFT
             // ============================================================
 
-            await publishEvent(
+            await broadcastRoomSSE(
                 String(room_id),
                 "room:user-removed",
                 {
@@ -565,17 +565,6 @@ function payloadInvolvesPlayer(payloadJson, playerId) {
         return false;
     }
     return false;
-}
-
-// ---------------- 3. CORE DATABASE SSE CURSORS ----------------
-
-async function cursorSet(playerId, lastId) {
-    //await pool.execute("UPDATE users SET last_event_id = ?, last_seen = NOW() WHERE player_id = ?", [lastId, playerId]);
-}
-
-async function roomMaxEventId(roomId) {
-    const [rows] = await pool.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM event_queue WHERE room_id = ?", [roomId]);
-    return rows.length ? parseInt(rows[0].max_id, 10) : 0;
 }
 
 async function getActiveDeckMorties(playerId) {
@@ -1022,10 +1011,9 @@ app.get('/sse', async (req, res) => {
                 placement: b.placement
             }));
         });
-        
-        last_id = await roomMaxEventId(room_id);
+
     } else {
-        last_id = clientLastEventId;
+        
     }
     // Core Event Streaming Loop
     while (connectionActive) {
@@ -1543,7 +1531,7 @@ app.post('/session/emote/room', async (req, res) => {
         `, [session_id]);
 
         // Publish the exact event + payload shape your client expects
-        await publishEvent(room_id, "emote:room", {
+        await broadcastRoomSSE(room_id, "emote:room", {
             player_id: player_id,
             emote: emote
         });
@@ -1970,11 +1958,96 @@ app.post('/session/join-room', async (req, res) => {
         
         const room = rooms[0];
         const room_id = room.room_id;
+		
+// ------------------------------------------------------------
+// HANDLE PREVIOUS ROOM / ROOM CHANGE
+// ------------------------------------------------------------
+
+const [previousRoomRows] = await pool.execute(
+    `SELECT room_id
+     FROM users
+     WHERE player_id = ?
+     LIMIT 1`,
+    [player_id]
+);
+
+const previousRoomId = previousRoomRows.length
+    ? String(previousRoomRows[0].room_id || "")
+    : "";
+
+const newRoomId = String(room_id);
+
+const playerSse = activeSseConnections.get(String(player_id));
+
+if (
+    previousRoomId !== "" &&
+    previousRoomId !== "0"
+) {
+    // Tell the other players in the old room
+    // that this player is leaving.
+    broadcastRoomSSE(
+        previousRoomId,
+        "room:user-removed",
+        {
+            room_id: previousRoomId,
+            player_id: String(player_id)
+        },
+        player_id
+    );
+
+    // --------------------------------------------------------
+    // MOVING TO A DIFFERENT ROOM
+    // --------------------------------------------------------
+
+    if (previousRoomId !== newRoomId) {
+
+        if (playerSse) {
+            const oldConnections =
+                activeRoomSseConnections.get(previousRoomId);
+
+            if (oldConnections) {
+                oldConnections.delete(playerSse);
+
+                if (oldConnections.size === 0) {
+                    activeRoomSseConnections.delete(previousRoomId);
+                }
+            }
+        }
+
+        //console.log(`[ROOM MOVE] ${player_id}: ${previousRoomId} -> ${newRoomId}`);
+    }
+
+    // --------------------------------------------------------
+    // REJOINING THE SAME ROOM
+    // --------------------------------------------------------
+
+    else {
+        console.log(
+            `[ROOM REJOIN] ${player_id} rejoining ${newRoomId}`
+        );
+    }
+}
 
         await pool.execute(
             `UPDATE users SET room_id = ?, state = 'WORLD', last_seen = NOW() WHERE player_id = ?`,
             [room_id, player_id]
         );
+		
+		// ------------------------------------------------------------
+// ENSURE PLAYER IS SUBSCRIBED TO THE NEW ROOM SSE
+// ------------------------------------------------------------
+
+if (playerSse) {
+    if (!activeRoomSseConnections.has(newRoomId)) {
+        activeRoomSseConnections.set(newRoomId, new Set());
+    }
+
+    activeRoomSseConnections
+        .get(newRoomId)
+        .add(playerSse);
+
+    //console.log(`[SSE ROOM REGISTER] player=${player_id} room=${newRoomId}`);
+}
 
         const [roomUsers] = await pool.execute(
             `SELECT player_id, username, player_avatar_id, level, state, active_deck_id 
@@ -2091,61 +2164,44 @@ app.post('/session/join-room', async (req, res) => {
             bots: bots
         };
 		
-// --- BROADCAST PLAYER JOINED TO OTHER PLAYERS IN THE ROOM ---
+        // --- BROADCAST PLAYER JOINED TO OTHER PLAYERS IN THE ROOM ---
+        const joiningUser = users.find(u => String(u.player_id) === String(player_id));
 
-const joiningUser = users.find(
-    u => String(u.player_id) === String(player_id)
-);
+        if (joiningUser) {
+            let currentPlacement;
 
-if (joiningUser) {
-    let currentPlacement;
+            if (world_id_in == 1) {
+                currentPlacement = [30, 35];
+            } else if (world_id_in == 2) {
+                currentPlacement = [21, 72];
+            } else if (world_id_in == 3) {
+                currentPlacement = [31, 50];
+            } else if (world_id_in == 4) {
+                currentPlacement = [31, 74];
+            } else if (world_id_in == 5) {
+                currentPlacement = [34, 15];
+            } else if (world_id_in == 6) {
+                currentPlacement = [49, 12];
+            } else if (world_id_in == 7) {
+                currentPlacement = [40, 84];
+            }
 
-    if (world_id_in == 1) {
-        currentPlacement = [30, 35];
-    } else if (world_id_in == 2) {
-        currentPlacement = [21, 72];
-    } else if (world_id_in == 3) {
-        currentPlacement = [31, 50];
-    } else if (world_id_in == 4) {
-        currentPlacement = [31, 74];
-    } else if (world_id_in == 5) {
-        currentPlacement = [34, 15];
-    } else if (world_id_in == 6) {
-        currentPlacement = [49, 12];
-    } else if (world_id_in == 7) {
-        currentPlacement = [40, 84];
-    }
+            const publishPayload = {
+                room_id: String(room_id),
+                player_id: String(joiningUser.player_id),
+                username: joiningUser.username,
+                player_avatar_id: joiningUser.player_avatar_id,
+                level: joiningUser.level,
+                owned_morties: joiningUser.owned_morties,
+                state: joiningUser.state || "WORLD",
+                shiny_if_potion: false,
+                streak: 0,
+                placement: currentPlacement
+            };
 
-    // Get the joining player's current UDP position if available
-    const livePos = livePlayerPositions.get(String(player_id));
-
-    if (livePos) {
-        currentPlacement = [
-            livePos.x,
-            livePos.y
-        ];
-    }
-
-    const publishPayload = {
-        room_id: room_id,
-        player_id: joiningUser.player_id,
-        username: joiningUser.username,
-        player_avatar_id: joiningUser.player_avatar_id,
-        level: joiningUser.level,
-        owned_morties: joiningUser.owned_morties,
-        state: joiningUser.state || "WORLD",
-        shiny_if_potion: false,
-        streak: 0,
-        placement: currentPlacement
-    };
-
-    broadcastRoomSSE(
-        room_id,
-        "room:user-added",
-        publishPayload,
-        player_id
-    );
-}
+           // Send to everyone in the room EXCEPT the player who just joined.
+           broadcastRoomSSE(String(room_id), "room:user-added", publishPayload, String(player_id));
+        }
 
         return res.json(responseData);
 
@@ -2187,7 +2243,7 @@ app.post('/session/leave-room', async (req, res) => {
         // 2. Broadcast leave event to everyone else via your existing event queue publisher
         // We look up the room_id from the user profile just like the PHP script's query
         if (room_id && room_id !== "0" && room_id !== "") {
-            await publishEvent(String(room_id), "room:user-removed", { room_id: String(room_id), player_id: String(player_id) }, player_id);
+            await broadcastRoomSSE(String(room_id), "room:user-removed", { room_id: String(room_id), player_id: String(player_id) }, player_id);
 			
 			//console.log("room id: ", String(room_id), "room:user-removed", {  room_id: String(room_id), player_id: String(player_id) }, player_id);
             
@@ -2275,7 +2331,7 @@ app.post('/session/state', async (req, res) => {
 
             // If the player is actively mapped to a valid room shard, broadcast the change to the SSE queue
             if (room_id && room_id !== "0" && room_id !== "") {
-                await publishEvent(
+                await broadcastRoomSSE(
                     room_id, 
                     "room:user-state-changed", 
                     { player_id: player_id, state: new_state }, 
@@ -2370,36 +2426,6 @@ function pickItemId(rarity, exclude = []) {
     return pool[Math.floor(Math.random() * pool.length)];
 }
 
-async function getAvailableSpawn(connection, roomId) {
-    const [rows] = await connection.execute(`
-        SELECT placement 
-        FROM event_queue 
-        WHERE room_id = ? 
-          AND event_name = 'room:pickup-added' 
-          AND pickup_id_collected_by_player_id IS NULL
-    `, [roomId]);
-
-    const used = {};
-    for (const row of rows) {
-        if (!row.placement) continue;
-        const parts = row.placement.split(',');
-        if (parts.length === 2) {
-            used[`${parts[0]},${parts[1]}`] = true;
-        }
-    }
-
-    const available = [];
-    for (const pt of PICKUP_POINTS) {
-        const key = `${pt[0]},${pt[1]}`;
-        if (!used[key]) {
-            available.push(pt);
-        }
-    }
-
-    const targetPool = available.length > 0 ? available : PICKUP_POINTS;
-    return targetPool[Math.floor(Math.random() * targetPool.length)];
-}
-
 function randomPickupContents(exclude = []) {
     const kind = weightedPick([
         { value: "single", weight: 70 },
@@ -2439,34 +2465,6 @@ function randomPickupContents(exclude = []) {
     });
 
     return items;
-}
-
-async function makeNewPickup(connection, roomId, exclude = []) {
-    const pos = await getAvailableSpawn(connection, roomId);
-    return {
-        pickup_id: uuidv4(),
-        placement: `${pos[0]},${pos[1]}`, // Match native string format splitting expectations
-        contents: randomPickupContents(exclude)
-    };
-}
-
-/**
- * Shared Local Helper to inject custom events into global streaming pipelines
- */
-async function publishLocalEvent(connection, roomId, eventName, payload) {
-    const placement = payload.placement || null;
-    const pickupId = payload.pickup_id || null;
-    
-    // Extract contents block if generating a pickup spawn sequence
-    let serializedContents = null;
-    if (payload.contents) {
-        serializedContents = JSON.stringify(payload.contents);
-    }
-
-    await connection.execute(`
-        INSERT INTO event_queue (room_id, event_name, pickup_id, placement, pick_up_contents, created_at)
-        VALUES (?, ?, ?, ?, ?, NOW())
-    `, [roomId, eventName, pickupId, placement, serializedContents]);
 }
 
 /**
@@ -2651,11 +2649,11 @@ app.post('/session/collect-pickup', async (req, res) => {
         }
 
         // 6. Broadcast removal and addition marker payloads update messages
-        await publishLocalEvent(connection, roomId, "room:pickup-removed", {
+        await broadcastRoomSSE(roomId, "room:pickup-removed", {
             pickup_id: pickupId
         });
 
-        await publishLocalEvent(connection, roomId, "room:pickup-added", newPickupPayload);
+        await broadcastRoomSSE(roomId, "room:pickup-added", newPickupPayload);
 
         // Commit transaction atomic balance states across tables cleanly
         await connection.commit();
@@ -3219,7 +3217,7 @@ app.post('/session/battle-wild-morty', async (req, res) => {
 		
 		Battles.set(finalBroadcastPayload);
             
-        await publishEvent(roomId, "room:wild-morty-state-changed", { wild_morty_id: wildMortyIdInput, state: "BATTLE" });
+        await broadcastRoomSSE(roomId, "room:wild-morty-state-changed", { wild_morty_id: wildMortyIdInput, state: "BATTLE" });
 
         // Immediately lock it in memory
         wildPayload.state = "BATTLE";
@@ -3277,7 +3275,7 @@ app.post('/session/battle/ready', async (req, res) => {
             return res.status(409).json({ success: false, error: "Room does not exist", room_id: roomId });
         }
 		
-		await publishEvent(roomId, "room:user-state-changed", { player_id: playerId, state: "BATTLE" });
+		await broadcastRoomSSE(roomId, "room:user-state-changed", { player_id: playerId, state: "BATTLE" });
 
         // 4. Construct payload tracking the specific battle details
         const battlePayload = {
@@ -3286,7 +3284,7 @@ app.post('/session/battle/ready', async (req, res) => {
         };
 
         // 6. Broadcast the clock frame to kick off the client UI clock tracking 
-        //await publishEvent(roomId, "battle:move-timer-started", battlePayload, playerId);
+        await sendPrivateSSE(roomId, "battle:move-timer-started", battlePayload, playerId);
 
         return res.json({ success: true });
 
@@ -3513,8 +3511,8 @@ app.post('/session/battle/move', async (req, res) => {
                     SpawnedMorties.set(key, roomMorties);
 
                     // 5. Broadcast despawn & spawn events to the room
-                    await publishEvent(roomId, "room:wild-morty-removed", { wild_morty_id: wildOwnedMortyId });
-                    await publishEvent(roomId, "room:wild-morty-added", { wild_morty: newWildMorty });
+                    await broadcastRoomSSE(roomId, "room:wild-morty-removed", { wild_morty_id: wildOwnedMortyId });
+                    await broadcastRoomSSE(roomId, "room:wild-morty-added", { wild_morty: newWildMorty });
 
                     outcome = "CAUGHT";
                     const newOwnedMortyId = crypto.randomUUID();
@@ -3581,7 +3579,7 @@ app.post('/session/battle/move', async (req, res) => {
                         // 2. Update the decks table with the new JSON string array
                         await pool.execute(`UPDATE decks SET owned_morty_ids = ? WHERE player_id = ? AND deck_id = ?`, [JSON.stringify(activeDeckArray), playerId, activeDeckId]);
 
-                        await publishEvent(roomId, "room:user-modified", {
+                        await broadcastRoomSSE(roomId, "room:user-modified", {
                             player_id: playerId,
                             username: player_username,
                             player_avatar_id: player_avatar_id,
@@ -3593,7 +3591,7 @@ app.post('/session/battle/move', async (req, res) => {
 
                     }
 
-                    await publishEvent(roomId, "battle:turn-result", {
+                    await sendPrivateSSE(roomId, "battle:turn-result", {
                         battle_id: battleId,
                         outcome: "CAUGHT",
                         turn_datas: turnDatas,
@@ -3672,7 +3670,7 @@ app.post('/session/battle/move', async (req, res) => {
                 }
 
                 // Evaluates for standard CONTINUE status updates
-                await publishEvent(roomId, "battle:turn-result", {
+                await sendPrivateSSE(roomId, "battle:turn-result", {
                     battle_id: battleId,
                     outcome: outcome,
                     turn_datas: turnDatas,
@@ -3773,7 +3771,7 @@ app.post('/session/battle/move', async (req, res) => {
                         outcome = "LOSE";
                     }
 
-                    await publishEvent(roomId, "battle:turn-result", {
+                    await sendPrivateSSE(roomId, "battle:turn-result", {
                         battle_id: battleId,
                         outcome: outcome,
                         turn_datas: turnDatas,
@@ -3841,7 +3839,7 @@ app.post('/session/battle/move', async (req, res) => {
                 wildPayload.state = "WORLD";
                 wildPayload._updated = new Date().toISOString();
 				
-                await publishEvent(roomId, "battle:turn-result", {
+                await sendPrivateSSE(roomId, "battle:turn-result", {
                     battle_id: battleId,
                     outcome: "RUN",
                     turn_datas: turnDatas,
@@ -3868,11 +3866,11 @@ app.post('/session/battle/move', async (req, res) => {
                     battle_abandoned: true
                 }, playerId);
 				
-				await publishEvent(roomId, "room:wild-morty-state-changed", {
+				await broadcastRoomSSE(roomId, "room:wild-morty-state-changed", {
                     wild_morty_id: wildOwnedMortyId,
                     state: "WORLD"
                 });
-                await publishEvent(roomId, "room:user-state-changed", {
+                await broadcastRoomSSE(roomId, "room:user-state-changed", {
                     player_id: playerId,
                     state: "WORLD"
                 });
@@ -5427,34 +5425,34 @@ app.post('/session/battle-bot', async (req, res) => {
         const botPayload = botRows[0];
 
 
-// Safely parse owned_morties (handles string, array, undefined, null)
-let morties = [];
-try {
-    if (typeof botPayload.owned_morties === 'string') {
-        morties = JSON.parse(botPayload.owned_morties);
-    } else if (Array.isArray(botPayload.owned_morties)) {
-        morties = botPayload.owned_morties;
-    }
-} catch (e) {
-    console.error("Failed to parse bot owned_morties JSON:", e);
-    morties = [];
-}
+        // Safely parse owned_morties (handles string, array, undefined, null)
+        let morties = [];
+        try {
+            if (typeof botPayload.owned_morties === 'string') {
+                morties = JSON.parse(botPayload.owned_morties);
+            } else if (Array.isArray(botPayload.owned_morties)) {
+                morties = botPayload.owned_morties;
+            }
+        } catch (e) {
+            console.error("Failed to parse bot owned_morties JSON:", e);
+            morties = [];
+        }
 
-// Ensure morties is an array
-if (!Array.isArray(morties)) {
-    morties = [];
-}
+        // Ensure morties is an array
+        if (!Array.isArray(morties)) {
+            morties = [];
+        }
 
-// 1. Collect ALL Morties formatted for the opponent payload
-const opponentOwnedMorties = morties.map((m) => ({
-    owned_morty_id: m.owned_morty_id || botIdInput,
-    morty_id: m.morty_id || botPayload.morty_id || "MortyAndroid",
-    level: parseInt(m.level || 5, 10),
-    xp: parseInt(m.xp || 5, 10),
-    hp: parseInt(m.hp || 20, 10),
-    variant: m.variant || botPayload.variant || "Normal",
-    hp_stat: parseInt(m.hp_stat || m.hp || 20, 10)
-}));
+        // 1. Collect ALL Morties formatted for the opponent payload
+        const opponentOwnedMorties = morties.map((m) => ({
+            owned_morty_id: m.owned_morty_id || botIdInput,
+            morty_id: m.morty_id || botPayload.morty_id || "MortyAndroid",
+            level: parseInt(m.level || 5, 10),
+            xp: parseInt(m.xp || 5, 10),
+            hp: parseInt(m.hp || 20, 10),
+            variant: m.variant || botPayload.variant || "Normal",
+            hp_stat: parseInt(m.hp_stat || m.hp || 20, 10)
+        }));
 
 
         // 4. Gather full target player information parameters
@@ -5648,9 +5646,9 @@ const opponentPayload = {
             meta: {}
         };
         
-        await publishEvent(roomId, "battle:start", finalBroadcastPayload, playerId);
-        await publishEvent(roomId, "room:bot-state-changed", { bot_id: botIdInput, state: "BATTLE" });
-        //await publishEvent(roomId, "room:user-state-changed", { player_id: playerId, state: "BATTLE" });
+        await sendPrivateSSE(roomId, "battle:start", finalBroadcastPayload, playerId);
+        await broadcastRoomSSE(roomId, "room:bot-state-changed", { bot_id: botIdInput, state: "BATTLE" });
+        //await broadcastRoomSSE(roomId, "room:user-state-changed", { player_id: playerId, state: "BATTLE" });
 
         return res.json({ success: true });
 		
@@ -5871,7 +5869,7 @@ app.post('/session/battle-invite/create', async (req, res) => {
     };
 
     // 8. Publish the event to the room
-    await publishEvent(roomId, "battle-invite:received", eventpayload, opponent.player_id);
+    await sendPrivateSSE(roomId, "battle-invite:received", eventpayload, opponent.player_id);
 
     // 9. Return the full structured payload to the HTTP response
     res.json(payload);
@@ -5944,7 +5942,7 @@ app.post('/session/battle-invite/response', async (req, res) => {
         battle_invite_id: battle_invite_id
       };
 
-      await publishEvent(roomId, "battle-invite:declined", declineEventPayload, from_player_id);
+      await sendPrivateSSE(roomId, "battle-invite:declined", declineEventPayload, from_player_id);
 
       return res.json({ success: true, accepted: false });
     }
@@ -5959,7 +5957,7 @@ app.post('/session/battle-invite/response', async (req, res) => {
       }
     };
 
-    await publishEvent(roomId, "battle-invite:accepted", acceptEventPayload, from_player_id);
+    await sendPrivateSSE(roomId, "battle-invite:accepted", acceptEventPayload, from_player_id);
 
     // Return successful response to responder including opponent profile details
     res.json({
@@ -7276,26 +7274,6 @@ app.post('/session/incentive/reject', async (req, res) => {
 
 });
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // UDP SERVER
 const udpPlayers = new Map();       // sessionHex -> player object
 const playersByRoom = new Map();    // roomId -> Map<sessionHex, player>
@@ -7409,15 +7387,6 @@ udpServer.on('message', (msg, rinfo) => {
 udpServer.bind(13001, '0.0.0.0', () => {
     console.log("UDP Movement Engine listening on 13001");
 });
-
-
-
-
-
-
-
-
-
 
 const PORT = 3000;
 const HOST = '0.0.0.0';
