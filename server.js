@@ -22,10 +22,10 @@ const toBool = (val) => val === true || val === 1 || String(val).toLowerCase() =
 
 // ---------------- 1. DATABASE CONFIGURATION ----------------
 const pool = mysql.createPool({
-    host: '192.168.1.142',
-    user: 'pocketmortymans',
-    password: '_YtGgA5J@!9Vk*va',
-    database: 'pocket_mortys',
+    host: 'localhost',
+    user: 'yourusername',
+    password: 'youpassword',
+    database: 'yourdatabase',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
@@ -335,9 +335,8 @@ async function initializeWorldRooms() {
 
 initializeWorldRooms();
 
-// Express health check endpoint
 app.get('/', (req, res) => {
-  res.status(200).json();
+  res.redirect(301, 'https://google.com');
 });
 
 // ---------------- HELPERS ----------------
@@ -368,7 +367,7 @@ setInterval(async () => {
             const player_id = String(player.player_id);
             const room_id = String(player.room_id);
 
-            console.log(`[Timeout!] Player ${player_id} has timed out from room ${room_id}.`);
+            //console.log(`[Timeout!] Player ${player_id} has timed out from room ${room_id}.`);
 
 // ============================================================
 // RETURN ANY WILD MORTIES BELONGING TO THIS TIMED-OUT PLAYER
@@ -405,7 +404,7 @@ if (typeof Battles !== 'undefined' && Battles instanceof Map) {
             battle.meta?.wild_morty_id || ""
         );
 
-        console.log(`[Timeout!] Player ${player_id} had Wild Morty ${wildMortyId} ` + `in battle ${battle.battle_id}. Returning Morty to WORLD.`);
+        //console.log(`[Timeout!] Player ${player_id} had Wild Morty ${wildMortyId} ` + `in battle ${battle.battle_id}. Returning Morty to WORLD.`);
 
         // Get the Morties currently spawned in that room
         const roomMorties = SpawnedMorties.get(battleRoomId);
@@ -434,14 +433,10 @@ if (typeof Battles !== 'undefined' && Battles instanceof Map) {
                     }
                 );
 
-                console.log(`[Timeout!] Wild Morty ${wildMortyId} returned to WORLD ` + `in room ${battleRoomId}.`);
+                //console.log(`[Timeout!] Wild Morty ${wildMortyId} returned to WORLD ` + `in room ${battleRoomId}.`);
 
             } else {
-
-                console.warn(
-                    `[Timeout!] Wild Morty ${wildMortyId} was not found ` +
-                    `in room ${battleRoomId}.`
-                );
+                //console.warn(`[Timeout!] Wild Morty ${wildMortyId} was not found ` + `in room ${battleRoomId}.`);
             }
         }
 
@@ -449,7 +444,7 @@ if (typeof Battles !== 'undefined' && Battles instanceof Map) {
         // Because the battle object itself is the key:
         Battles.delete(battle);
 
-        console.log(`[Timeout!] Removed abandoned PvWM battle ${battle.battle_id}.`);
+        //console.log(`[Timeout!] Removed abandoned PvWM battle ${battle.battle_id}.`);
     }
 }
 
@@ -754,7 +749,7 @@ app.post('/user/login', async (req, res) => {
         const tags = user.tags;
         
         const session_id = crypto.randomUUID(); 
-        const ping_url = 'https://dev-game.conspiracyrick.com/session/ping-dynamic';
+        const ping_url = 'https://game.conspiracyrick.com/session/ping-dynamic';
         
         const iat = Math.floor(Date.now() / 1000); 
         const exp = iat + 60; 
@@ -788,7 +783,7 @@ app.post('/user/login', async (req, res) => {
         const jwt = `${base64Header}.${base64Payload}.${base64Signature}`;
 
         const responseData = {
-            session_url: `https://dev-game.conspiracyrick.com/sse/?token=${jwt}`,
+            session_url: `https://game.conspiracyrick.com/sse/?token=${jwt}`,
             session_url_ttl: "60"
         };
 
@@ -884,7 +879,7 @@ app.get('/sse', async (req, res) => {
 
     const player_id = String(user.player_id);
     const tags = normalizeTags(user.tags);
-    const ping_url = String(profile?.ping_url || "https://dev-game.conspiracyrick.com/session/ping-dynamic");
+    const ping_url = String(profile?.ping_url || "https://game.conspiracyrick.com/session/ping-dynamic");
 
     // --- 1. REGISTER CONNECTION FOR DYNAMIC PING ROUTING ---
     activeSseConnections.set(player_id, sseSend);
@@ -2022,9 +2017,7 @@ if (
     // --------------------------------------------------------
 
     else {
-        console.log(
-            `[ROOM REJOIN] ${player_id} rejoining ${newRoomId}`
-        );
+        //console.log(`[ROOM REJOIN] ${player_id} rejoining ${newRoomId}`);
     }
 }
 
@@ -2997,9 +2990,7 @@ app.post('/session/battle-wild-morty', async (req, res) => {
         );
 
         if (!wildPayload) {
-            console.log(
-                `[PvWM] Morty ${wildMortyIdInput} does not exist in room ${roomId}`
-            );
+            //console.log(`[PvWM] Morty ${wildMortyIdInput} does not exist in room ${roomId}`);
 
             return res.status(409).json({
                 success: false,
@@ -3432,7 +3423,7 @@ app.post('/session/battle/move', async (req, res) => {
 			);
 
 			if (!wildPayload) {
-				console.log(`[PvWM] Morty ${wildOwnedMortyId} does not exist in room ${roomId}`);
+				//console.log(`[PvWM] Morty ${wildOwnedMortyId} does not exist in room ${roomId}`);
                 return res.status(409).json({success: false,error: "Morty does not exist in this room"});
             }
 
@@ -4641,185 +4632,134 @@ app.post('/session/dispense-item', async (req, res) => {
 });
 
 
-app.post('/session/challenge/list', (req, res) => {
+app.post('/session/challenge/list', async (req, res) => {
     res.setHeader('X-Powered-By', 'Express');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Vary', 'Accept-Encoding');
 
-    const challenges = [
-        {
-            challenge_id: "9e5d1da5-e8d1-46a0-bb66-3ffc6b9c21ee",
-            target: 3,
-            reward_type: "COUPON",
-            reward_amount: 1,
-            reward_id: null,
-            reward_parameters: null,
-            cooldown: 0,
-            is_daily: true,
-            tag: "BattleWinPvWM",
-            tag_id: null,
-            challange_name: null,
-            progress: 3,
-            cooldown_expires: null,
-            in_cooldown: false,
-            end_time: "2026-01-28T04:59:59.999Z"
-        },
-        {
-            challenge_id: "98d200db-fb67-46df-94ea-d73667b52ec0",
-            target: 1,
-            reward_type: "ITEM",
-            reward_amount: 1,
-            reward_id: "ItemGreatSerum",
-            reward_parameters: null,
-            cooldown: 0,
-            is_daily: true,
-            tag: "PurchaseItemName",
-            tag_id: "ItemPoisonCure",
-            challange_name: null,
-            progress: 0,
-            cooldown_expires: null,
-            in_cooldown: false,
-            end_time: "2026-01-28T04:59:59.999Z"
-        },
-        {
-            challenge_id: "7c812c30-29d4-47d1-bd83-31c25ce921ff",
-            target: 1,
-            reward_type: "COIN",
-            reward_amount: 200,
-            reward_id: null,
-            reward_parameters: null,
-            cooldown: 0,
-            is_daily: true,
-            tag: "PurchaseItemName",
-            tag_id: "ItemGreatSerum",
-            challange_name: null,
-            progress: 0,
-            cooldown_expires: null,
-            in_cooldown: false,
-            end_time: "2026-01-28T04:59:59.999Z"
-        },
-        {
-            challenge_id: "a0d87751-c5d3-46a7-b9c6-d12607ec514b",
-            target: 1,
-            reward_type: "COIN",
-            reward_amount: 500,
-            reward_id: null,
-            reward_parameters: null,
-            cooldown: 0,
-            is_daily: true,
-            tag: "UseItemName",
-            tag_id: "ItemMegaSeedLevelUp",
-            challange_name: null,
-            progress: 0,
-            cooldown_expires: null,
-            in_cooldown: false,
-            end_time: "2026-01-28T04:59:59.999Z"
-        },
-        {
-            challenge_id: "5433a483-b571-448d-a096-19d097f55447",
-            target: 4,
-            reward_type: "COIN",
-            reward_amount: 100,
-            reward_id: null,
-            reward_parameters: null,
-            cooldown: 0,
-            is_daily: true,
-            tag: "BattleCompleteArena",
-            tag_id: null,
-            challange_name: null,
-            progress: 0,
-            cooldown_expires: null,
-            in_cooldown: false,
-            end_time: "2026-01-28T04:59:59.999Z"
-        },
-        {
-            challenge_id: "783a59bc-7694-4124-8ca3-baca6f7e9b47",
-            target: 2,
-            reward_type: "COIN",
-            reward_amount: 200,
-            reward_id: null,
-            reward_parameters: null,
-            cooldown: 0,
-            is_daily: true,
-            tag: "EvolveMorty",
-            tag_id: null,
-            challange_name: null,
-            progress: 0,
-            cooldown_expires: null,
-            in_cooldown: false,
-            end_time: "2026-01-28T04:59:59.999Z"
-        },
-        {
-            challenge_id: "b2cd638c-ef0c-4c47-bf3f-6b08ef6c07f1",
-            target: 5,
-            reward_type: "COIN",
-            reward_amount: 100,
-            reward_id: null,
-            reward_parameters: null,
-            cooldown: 0,
-            is_daily: true,
-            tag: "WildMorty",
-            tag_id: null,
-            challange_name: null,
-            progress: 0,
-            cooldown_expires: null,
-            in_cooldown: false,
-            end_time: "2026-01-28T04:59:59.999Z"
-        },
-        {
-            challenge_id: "715473f3-bf86-4310-b5b7-163e324feaa2",
-            target: 4,
-            reward_type: "COIN",
-            reward_amount: 100,
-            reward_id: null,
-            reward_parameters: null,
-            cooldown: 0,
-            is_daily: true,
-            tag: "BattleCompleteArena",
-            tag_id: null,
-            challange_name: null,
-            progress: 0,
-            cooldown_expires: null,
-            in_cooldown: false,
-            end_time: "2026-01-28T04:59:59.999Z"
-        },
-        {
-            challenge_id: "5c27e488-3a08-43cd-b40e-323168e772eb",
-            target: 5,
-            reward_type: "ITEM",
-            reward_amount: 1,
-            reward_id: "ItemCable",
-            reward_parameters: null,
-            cooldown: 0,
-            is_daily: true,
-            tag: "BattleCatchPvWMElement",
-            tag_id: "Rock",
-            challange_name: null,
-            progress: 0,
-            cooldown_expires: null,
-            in_cooldown: false,
-            end_time: "2026-01-28T04:59:59.999Z"
-        },
-        {
-            challenge_id: "9b99c800-b69f-44e3-b7e1-651644e94b83",
-            target: 1,
-            reward_type: "ITEM",
-            reward_amount: 1,
-            reward_id: "ItemParalysisCure",
-            reward_parameters: null,
-            cooldown: 0,
-            is_daily: true,
-            tag: "UseItemName",
-            tag_id: "ItemPoisonCure",
-            challange_name: null,
-            progress: 0,
-            cooldown_expires: null,
-            in_cooldown: false,
-            end_time: "2026-01-28T04:59:59.999Z"
-        }
-    ];
+    try {
+        const query = `
+            SELECT 
+                challenge_id,
+                target,
+                reward_type,
+                reward_amount,
+                reward_id,
+                reward_parameters,
+                cooldown,
+                is_daily,
+                tag,
+                tag_id,
+                challange_name,
+                progress,
+                cooldown_expires,
+                in_cooldown,
+                end_time
+            FROM challenges
+        `;
 
-    return res.status(200).json(challenges);
+        const [rows] = await pool.query(query);
+
+        // Format MySQL values to match expected JSON types (booleans & ISO dates)
+        const challenges = rows.map(row => ({
+            challenge_id: row.challenge_id,
+            target: row.target,
+            reward_type: row.reward_type,
+            reward_amount: row.reward_amount,
+            reward_id: row.reward_id,
+            reward_parameters: row.reward_parameters,
+            cooldown: row.cooldown,
+            is_daily: Boolean(row.is_daily),
+            tag: row.tag,
+            tag_id: row.tag_id,
+            challange_name: row.challange_name,
+            progress: row.progress,
+            cooldown_expires: row.cooldown_expires ? new Date(row.cooldown_expires).toISOString() : null,
+            in_cooldown: Boolean(row.in_cooldown),
+            end_time: row.end_time ? new Date(row.end_time).toISOString() : null
+        }));
+
+        return res.status(200).json(challenges);
+    } catch (error) {
+        console.error('Error fetching challenges:', error);
+        return res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+app.post('/session/challenge/claim-reward', async (req, res) => {
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    // Handle payload from headers or body
+    const challenge_id = req.body?.challenge_id || req.headers['challenge_id'];
+    const session_id = req.body?.session_id || req.headers['session_id'];
+
+    if (!challenge_id || !session_id) {
+        return res.status(400).json({ error: 'Missing challenge_id or session_id' });
+    }
+
+    try {
+        // 1. Fetch challenge details from DB
+        const [rows] = await pool.query(`SELECT * FROM challenges WHERE challenge_id = ?`,[challenge_id]);
+
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Challenge not found' });
+        }
+
+        const challengeData = rows[0];
+
+        // 2. Calculate cooldown expiration (e.g. current time + cooldown seconds)
+        const now = Math.floor(Date.now() / 1000);
+        const cooldownDuration = challengeData.cooldown || 86400; // default 24h if set to 0
+        const cooldownExpires = now + cooldownDuration;
+
+        // 3. Mark challenge as in cooldown in DB
+        //await pool.query(`UPDATE challenges SET in_cooldown = 1, cooldown_expires = FROM_UNIXTIME(?) WHERE challenge_id = ?`,[cooldownExpires, challenge_id]);
+
+        // 4. Determine total item quantity in user inventory (example logic)
+        let totalQuantity = challengeData.reward_amount;
+        if (challengeData.reward_type === 'ITEM' && challengeData.reward_id) {
+            // Option to fetch existing user quantity from user inventory table:
+            // const [inv] = await db.query(`SELECT quantity FROM user_items WHERE session_id = ? AND item_id = ?`, [session_id, challengeData.reward_id]);
+            // totalQuantity = (inv[0]?.quantity || 0) + challengeData.reward_amount;
+        }
+
+        // 5. Construct payload matching exact client response format
+        const responseData = {
+            challenge: {
+                challenge_id: challengeData.challenge_id,
+                target: challengeData.target,
+                reward_type: challengeData.reward_type,
+                reward_amount: challengeData.reward_amount,
+                reward_id: challengeData.reward_id,
+                reward_parameters: challengeData.reward_parameters,
+                cooldown: challengeData.cooldown,
+                is_daily: Boolean(challengeData.is_daily),
+                tag: challengeData.tag,
+                tag_id: challengeData.tag_id,
+                challange_name: challengeData.challange_name,
+                progress: challengeData.progress,
+                cooldown_expires: cooldownExpires,
+                in_cooldown: true,
+                end_time: challengeData.end_time ? new Date(challengeData.end_time).toISOString() : null
+            },
+            reward: {
+                type: challengeData.reward_type,
+                item_id: challengeData.reward_id,
+                quantity: totalQuantity,
+                amount_received: challengeData.reward_amount,
+                amount: challengeData.reward_amount
+            },
+            challenge_reward: true
+        };
+
+        return res.status(200).json(responseData);
+
+    } catch (error) {
+        console.error('Error claiming challenge reward:', error);
+        return res.status(500).json({ error: 'Internal Server Error' });
+    }
 });
 
 // POST /session/player-avatar/set-active
@@ -4949,7 +4889,7 @@ app.post('/session/player-avatar/buy', async (req, res) => {
     }
 });
 
-// POST /session/buy-item (or whatever your path is)
+
 app.post('/session/buy-item', async (req, res) => {
     // Set response headers
     res.setHeader('X-Powered-By', 'Express');
@@ -4969,6 +4909,24 @@ app.post('/session/buy-item', async (req, res) => {
                 error: { code: "BAD_REQUEST" }
             });
         }
+		
+		const SHOP_ITEMS = {
+		    ItemShinyPotion: { currency: 'coupons', price: 5 },
+		    ItemMortyChip: { currency: 'coins', price: 500 },
+		    ItemSerum: { currency: 'coins', price: 250 },
+		    ItemGreatSerum: { currency: 'coins', price: 500 },
+		    ItemPoisonCure: { currency: 'coins', price: 500 },
+		    ItemParalysisCure: { currency: 'coins', price: 500 },
+		    ItemPlutonicRock: { currency: 'coins', price: 200 }
+        };
+		
+		const shopItem = SHOP_ITEMS[item_id];
+		
+		if (!shopItem) {
+		    return res.status(409).json({
+                error: { code: "ITEM_NOT_AVAILABLE" }
+            });
+        }
 
         // Validate user session
         const [users] = await pool.execute(
@@ -4985,8 +4943,8 @@ app.post('/session/buy-item', async (req, res) => {
         }
 
         const player_id = user.player_id;
-		const coins = user.coins;
-		const coupons = user.coupons;
+		let coupons = user.coupons;
+        let coins = user.coins;
 
         // Check if item already exists in inventory
         const [items] = await pool.execute(
@@ -4995,38 +4953,63 @@ app.post('/session/buy-item', async (req, res) => {
         );
 
         const existingItem = items[0];
-        let final_qty = 1;
 
+        // Check item limit BEFORE charging the player
         if (existingItem) {
             const current_qty = Number(existingItem.quantity);
-
             // Limit reached
             if (current_qty >= MAX_ITEM_LIMIT) {
                 return res.status(409).json({
                     error: { code: "ITEM_LIMIT" }
                 });
             }
+        }
 
+        // Charge player
+        if (shopItem.currency === 'coupons') {
+
+            if (coupons < shopItem.price) {
+                return res.status(409).json({
+                    error: { code: "NO_COUPON" }
+                });
+            }
+
+            coupons -= shopItem.price;
+
+        } else if (shopItem.currency === 'coins') {
+
+            if (coins < shopItem.price) {
+                return res.status(409).json({
+                    error: { code: "NO_COIN" }
+                });
+            }
+
+            coins -= shopItem.price;
+        }
+
+        // Save new currency balance
+        await pool.execute(
+            'UPDATE users SET coins = ?, coupons = ? WHERE player_id = ?',
+            [coins, coupons, player_id]
+        );
+
+        let final_qty = 1;
+
+        if (existingItem) {
+            const current_qty = Number(existingItem.quantity);
+			
             // Update quantity
             final_qty = Math.min(current_qty + 1, MAX_ITEM_LIMIT);
-
-            await pool.execute(
-                'UPDATE owned_items SET quantity = ? WHERE player_id = ? AND item_id = ?',
-                [final_qty, player_id, item_id]
-            );
+            await pool.execute('UPDATE owned_items SET quantity = ? WHERE player_id = ? AND item_id = ?', [final_qty, player_id, item_id]);
         } else {
             // Insert new item record
-            await pool.execute(
-                'INSERT INTO owned_items (player_id, item_id, quantity) VALUES (?, ?, 1)',
-                [player_id, item_id]
-            );
-
+            await pool.execute('INSERT INTO owned_items (player_id, item_id, quantity) VALUES (?, ?, 1)',[player_id, item_id]);
             final_qty = 1;
         }
 
         // Success response
         return res.status(200).json({
-            coins: coins, // Replace with real player coins value if needed
+            coins: coins,
             coupons: coupons,
             result: {
                 type: "ITEM",
@@ -7273,6 +7256,218 @@ app.post('/session/incentive/reject', async (req, res) => {
     }
 
 });
+
+app.post('/session/owned_morties/learn-attacks', async (req, res) => {
+    // 1. Set response headers
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    const data = req.body;
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        return res.status(400).json({ error: { code: "BAD_REQUEST" } });
+    }
+
+    const sessionId = String(data.session_id || '');
+    const morties = Array.isArray(data.owned_morties) ? data.owned_morties : [];
+
+    if (sessionId === '' || morties.length === 0) {
+        return res.status(400).json({ error: { code: "BAD_REQUEST" } });
+    }
+
+    try {
+        // ============================
+        // 🔐 AUTH
+        // ============================
+        const [userRows] = await pool.execute(`
+            SELECT * FROM users WHERE session_id = ? LIMIT 1
+        `, [sessionId]);
+
+        if (!userRows.length) {
+            return res.status(401).json({ error: { code: "NOT_AUTHENTICATED" } });
+        }
+
+        const user = userRows[0];
+        const playerId = user.player_id;
+
+        // ============================
+        // 🔥 PROCESS + TRACK UPDATED
+        // ============================
+        const updatedIds = [];
+        const connection = await pool.getConnection();
+
+        try {
+            await connection.beginTransaction();
+
+            for (const m of morties) {
+                if (!m || typeof m !== 'object') continue;
+
+                const ownedMortyId = String(m.owned_morty_id || '');
+                let attackIds = Array.isArray(m.attack_ids) ? m.attack_ids : [];
+
+                if (ownedMortyId === '' || attackIds.length === 0) continue;
+
+                // Limit to 4 attacks (game behavior)
+                attackIds = attackIds.slice(0, 4);
+
+                // Verify ownership
+                const [checkRows] = await connection.execute(`
+                    SELECT owned_morty_id 
+                    FROM owned_morties 
+                    WHERE owned_morty_id = ? AND player_id = ?
+                    LIMIT 1
+                `, [ownedMortyId, playerId]);
+
+                if (!checkRows.length) continue;
+
+                // Build JSON structure filtering out null / empty attack slots
+                const attacksArray = [];
+                let slotIndex = 0;
+
+                for (const rawAttackId of attackIds) {
+                    if (rawAttackId !== null && rawAttackId !== undefined && String(rawAttackId).trim() !== '') {
+                        attacksArray.push({
+                            attack_id: String(rawAttackId),
+                            pp: 12,
+                            pp_stat: 12,
+                            position: slotIndex
+                        });
+                        slotIndex++;
+                    }
+                }
+
+                // Update attacks_array directly on owned_morties table
+                await connection.execute(`
+                    UPDATE owned_morties 
+                    SET attacks_array = ?
+                    WHERE owned_morty_id = ? AND player_id = ?
+                `, [JSON.stringify(attacksArray), ownedMortyId, playerId]);
+
+                updatedIds.push(ownedMortyId);
+            }
+
+            await connection.commit();
+            connection.release();
+        } catch (txErr) {
+            await connection.rollback();
+            connection.release();
+            throw txErr;
+        }
+
+        // ============================
+        // 🔥 FETCH ONLY UPDATED MORTIES
+        // ============================
+        if (updatedIds.length === 0) {
+            return res.status(200).json({
+                player_id: user.player_id,
+                username: user.username,
+                player_avatar_id: user.player_avatar_id || "AvatarRickDefault",
+                level: parseInt(user.level, 10),
+                xp: parseInt(user.xp, 10),
+                streak: parseInt(user.streak, 10),
+                coins: parseInt(user.coins, 10),
+                coupons: parseInt(user.coupons, 10),
+                permits: parseInt(user.permits, 10),
+                owned_morties: [],
+                xp_lower: parseInt(user.xp_lower, 10),
+                xp_upper: parseInt(user.xp_upper, 10),
+                tags: []
+            });
+        }
+
+        const placeholders = updatedIds.map(() => '?').join(',');
+        const queryParams = [playerId, ...updatedIds];
+
+        const [rows] = await pool.execute(`
+            SELECT *
+            FROM owned_morties
+            WHERE player_id = ?
+              AND owned_morty_id IN (${placeholders})
+        `, queryParams);
+
+        // ============================
+        // 🔥 BUILD RESPONSE
+        // ============================
+        const ownedMorties = rows.map(row => {
+            let attacks = [];
+            if (row.attacks_array) {
+                try {
+                    attacks = typeof row.attacks_array === 'string' 
+                        ? JSON.parse(row.attacks_array) 
+                        : row.attacks_array;
+                } catch (e) {
+                    attacks = [];
+                }
+            }
+
+            return {
+                owned_morty_id: row.owned_morty_id,
+                morty_id: row.morty_id,
+                level: parseInt(row.level, 10),
+                xp: parseInt(row.xp, 10),
+                hp: parseInt(row.hp, 10),
+                hp_stat: parseInt(row.hp_stat, 10),
+                attack_stat: parseInt(row.attack_stat, 10),
+                defence_stat: parseInt(row.defence_stat, 10),
+                variant: row.variant || "Normal",
+                speed_stat: parseInt(row.speed_stat, 10),
+                is_locked: Boolean(row.is_locked),
+                is_trading_locked: Boolean(row.is_trading_locked),
+                fight_pit_id: row.fight_pit_id ? row.fight_pit_id : null,
+                evolution_points: parseInt(row.evolution_points, 10),
+                xp_lower: parseInt(row.xp_lower, 10),
+                xp_upper: parseInt(row.xp_upper, 10),
+                owned_attacks: Array.isArray(attacks) ? attacks : []
+            };
+        });
+
+        // ============================
+        // 🔥 FINAL RESPONSE
+        // ============================
+        return res.status(200).json({
+            player_id: user.player_id,
+            username: user.username,
+            player_avatar_id: user.player_avatar_id || "AvatarRickDefault",
+            level: parseInt(user.level, 10),
+            xp: parseInt(user.xp, 10),
+            streak: parseInt(user.streak, 10),
+            coins: parseInt(user.coins, 10),
+            coupons: parseInt(user.coupons, 10),
+            permits: parseInt(user.permits, 10),
+            owned_morties: ownedMorties,
+            xp_lower: parseInt(user.xp_lower, 10),
+            xp_upper: parseInt(user.xp_upper, 10),
+            tags: []
+        });
+
+    } catch (err) {
+        console.error(">>> [LEARN ATTACKS CRITICAL ERROR]:", err);
+        return res.status(500).json({
+            error: { code: "SERVER_ERROR" }
+        });
+    }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // UDP SERVER
 const udpPlayers = new Map();       // sessionHex -> player object
