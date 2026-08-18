@@ -28,13 +28,23 @@ This will install all the currently required libraries
 ## To Do
 - Battle Bots
 - Battle friends
+- PVP
 - Raid & other event Battles
+- Fight Pit battles and scores
 - Use Items
 - Release Morties
-- Crafting
-- Challenges
+- Blend morties, Buy more deck slots & Upgrade Storage in Morty Daycare
+- Challenges (Now just doesn't save.)
+- When battling morties we don't own insert into mortydex as false unless caught which should be true
+- When we change the positions of morties or decks or morties in decks we need to run room:user-modified
+- Correct stats to their proper stats when caught and let it scale for ivs and evs
+- Leveling up player level and morties
+- Get the swap shop working again
+- Rotate Events
+- Rotate Morties in Gacha
 
 ## Completed
+- <s>Crafting</s>
 - <s>Battle & catch mortys</s>
 - <s>Lock Morties</s>
 - <s>Fix item spawning</s>

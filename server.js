@@ -24,8 +24,8 @@ const toBool = (val) => val === true || val === 1 || String(val).toLowerCase() =
 const pool = mysql.createPool({
     host: 'localhost',
     user: 'yourusername',
-    password: 'youpassword',
-    database: 'yourdatabase',
+    password: 'yourpassword',
+    database: 'yourdb',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
@@ -335,9 +335,8 @@ async function initializeWorldRooms() {
 
 initializeWorldRooms();
 
-app.get('/', (req, res) => {
-  res.redirect(301, 'https://google.com');
-});
+// Express health check endpoint 
+app.get('/', (req, res) => { res.status(200).json(); });
 
 // ---------------- HELPERS ----------------
 async function requireUserBySession(sessionId) {
@@ -7450,6 +7449,475 @@ app.post('/session/owned_morties/learn-attacks', async (req, res) => {
 });
 
 
+const recipes = [
+    {
+        recipe_id: "RecipeMortyChip",
+        item_id_1: "ItemSuperchargedBattery",
+        item_id_2: "ItemCircuitBoard",
+        item_id_3: "ItemTinCan",
+        resultid: "ItemMortyChip"
+    },
+    {
+        recipe_id: "RecipeSerum",
+        item_id_1: "ItemBattery",
+        item_id_2: "ItemFleeb",
+        item_id_3: "",
+        resultid: "ItemSerum"
+    },
+    {
+        recipe_id: "RecipeGreatSerum",
+        item_id_1: "ItemBattery",
+        item_id_2: "ItemPureFleeb",
+        item_id_3: "",
+        resultid: "ItemGreatSerum"
+    },
+    {
+        recipe_id: "RecipeSensationalSerum",
+        item_id_1: "ItemSuperchargedBattery",
+        item_id_2: "ItemSerum",
+        item_id_3: "",
+        resultid: "ItemSensationalSerum"
+    },
+    {
+        recipe_id: "RecipePureSerum",
+        item_id_1: "ItemSuperchargedBattery",
+        item_id_2: "ItemGreatSerum",
+        item_id_3: "",
+        resultid: "ItemPureSerum"
+    },
+    {
+        recipe_id: "RecipeHalzinger",
+        item_id_1: "ItemBattery",
+        item_id_2: "ItemFleeb",
+        item_id_3: "ItemBacteriaCell",
+        resultid: "ItemHalzinger"
+    },
+    {
+        recipe_id: "RecipePureHalzinger",
+        item_id_1: "ItemBattery",
+        item_id_2: "ItemPureFleeb",
+        item_id_3: "ItemMutantBacteriaCell",
+        resultid: "ItemPureHalzinger"
+    },
+    {
+        recipe_id: "RecipePoisonCure",
+        item_id_1: "ItemTinCan",
+        item_id_2: "ItemBacteriaCell",
+        item_id_3: "ItemDarkEnergyBall",
+        resultid: "ItemPoisonCure"
+    },
+    {
+        recipe_id: "RecipeParalysisCure",
+        item_id_1: "ItemTinCan",
+        item_id_2: "ItemTurbulentJuiceTube",
+        item_id_3: "ItemDarkEnergyBall",
+        resultid: "ItemParalysisCure"
+    },
+    {
+        recipe_id: "RecipeFullRecover",
+        item_id_1: "ItemPureFleeb",
+        item_id_2: "ItemMutantBacteriaCell",
+        item_id_3: "ItemSuperchargedBattery",
+        resultid: "ItemFullRecover"
+    },
+    {
+        recipe_id: "RecipePlutonicRock",
+        item_id_1: "ItemBattery",
+        item_id_2: "ItemBacteriaCell",
+        item_id_3: "",
+        resultid: "ItemPlutonicRock"
+    },
+    {
+        recipe_id: "RecipePurePlutonicRock",
+        item_id_1: "ItemBattery",
+        item_id_2: "ItemMutantBacteriaCell",
+        item_id_3: "",
+        resultid: "ItemPurePlutonicRock"
+    },
+    {
+        recipe_id: "RecipeMegaSeedLevelUp",
+        item_id_1: "ItemMegaSeedAttack",
+        item_id_2: "ItemMegaSeedDefence",
+        item_id_3: "ItemMegaSeedSpeed",
+        resultid: "ItemMegaSeedLevelUp"
+    },
+    {
+        recipe_id: "RecipeBattery",
+        item_id_1: "ItemTinCan",
+        item_id_2: "ItemCable",
+        item_id_3: "ItemFleeb",
+        resultid: "ItemBattery"
+    },
+    {
+        recipe_id: "RecipeSuperchargedBattery",
+        item_id_1: "ItemBattery",
+        item_id_2: "ItemTurbulentJuiceTube",
+        item_id_3: "",
+        resultid: "ItemSuperchargedBattery"
+    },
+    {
+        recipe_id: "RecipePureSqueezedFleeb",
+        item_id_1: "ItemFleeb",
+        item_id_2: "ItemTurbulentJuiceTube",
+        item_id_3: "",
+        resultid: "ItemPureFleeb"
+    },
+    {
+        recipe_id: "RecipeMutantBacteriaCell",
+        item_id_1: "ItemBacteriaCell",
+        item_id_2: "ItemTurbulentJuiceTube",
+        item_id_3: "",
+        resultid: "ItemMutantBacteriaCell"
+    },
+    {
+        recipe_id: "RecipeDarkEnergyBall",
+        item_id_1: "ItemFleeb",
+        item_id_2: "ItemBacteriaCell",
+        item_id_3: "",
+        resultid: "ItemDarkEnergyBall"
+    },
+    {
+        recipe_id: "RecipeBreakfastMedley",
+        item_id_1: "ItemChickenBiscuit",
+        item_id_2: "ItemIcedCoffee",
+        item_id_3: "ItemBreakfastBurger",
+        resultid: "ItemBreakfastMedley"
+    },
+    {
+        recipe_id: "RecipeSpicyBBQPizza",
+        item_id_1: "ItemPizzaSlice",
+        item_id_2: "ItemBBQSauce",
+        item_id_3: "ItemJalapeno",
+        resultid: "ItemSpicyBBQPizza"
+    },
+    {
+        recipe_id: "RecipeToxicBundle",
+        item_id_1: "ItemBenzene",
+        item_id_2: "ItemAcetaldehyde",
+        item_id_3: "ItemFormaldehyde",
+        resultid: "ItemToxicBundle"
+    },
+    {
+        recipe_id: "RecipeVapeIncineratingRocket",
+        item_id_1: "ItemBigTube",
+        item_id_2: "ItemTrafficCone",
+        item_id_3: "ItemRocketFuel",
+        resultid: "ItemVapeIncineratingRocket"
+    }
+];
+app.post('/session/recipe/use', async (req, res) => {
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    const MAX_ITEM_LIMIT = 10;
+
+    const connection = await pool.getConnection();
+
+    try {
+        const body = req.body || {};
+
+        const session_id = String(body.session_id || '').trim();
+        const recipe_id = String(body.recipe_id || '').trim();
+
+        if (!session_id || !recipe_id) {
+            return res.status(400).json({
+                error: {
+                    code: 'INVALID_REQUEST'
+                }
+            });
+        }
+
+        // ---------------------------------------------------------
+        // Find the recipe
+        // ---------------------------------------------------------
+
+        const recipe = recipes.find(
+            r => String(r.recipe_id) === recipe_id
+        );
+
+        if (!recipe) {
+            return res.status(400).json({
+                error: {
+                    code: 'RECIPE_NOT_FOUND'
+                }
+            });
+        }
+
+        // ---------------------------------------------------------
+        // Get the player from the session
+        // ---------------------------------------------------------
+
+        const [sessionRows] = await connection.execute(
+            `
+            SELECT player_id
+            FROM users
+            WHERE session_id = ?
+            LIMIT 1
+            `,
+            [session_id]
+        );
+
+        if (!sessionRows.length) {
+            return res.status(401).json({
+                error: {
+                    code: 'INVALID_SESSION'
+                }
+            });
+        }
+
+        const player_id = sessionRows[0].player_id;
+
+        // ---------------------------------------------------------
+        // Build required ingredient list
+        // ---------------------------------------------------------
+
+        const requiredItems = [
+            recipe.item_id_1,
+            recipe.item_id_2,
+            recipe.item_id_3
+        ].filter(itemId => {
+            return itemId &&
+                   String(itemId).trim() !== '';
+        });
+
+        if (!requiredItems.length) {
+            return res.status(400).json({
+                error: {
+                    code: 'INVALID_RECIPE'
+                }
+            });
+        }
+
+        // Prevent duplicate ingredient IDs
+        const uniqueRequiredItems = [...new Set(requiredItems)];
+
+        // ---------------------------------------------------------
+        // Validate result ID
+        // ---------------------------------------------------------
+
+        const resultId = String(recipe.resultid || '').trim();
+
+        if (!resultId) {
+            return res.status(400).json({
+                error: {
+                    code: 'INVALID_RECIPE'
+                }
+            });
+        }
+
+        // ---------------------------------------------------------
+        // Start transaction
+        // ---------------------------------------------------------
+
+        await connection.beginTransaction();
+
+        // ---------------------------------------------------------
+        // Lock the player's required inventory rows
+        // ---------------------------------------------------------
+
+        const placeholders = uniqueRequiredItems
+            .map(() => '?')
+            .join(',');
+
+        const [ownedRows] = await connection.execute(
+            `
+            SELECT item_id, quantity
+            FROM owned_items
+            WHERE player_id = ?
+              AND item_id IN (${placeholders})
+            FOR UPDATE
+            `,
+            [
+                player_id,
+                ...uniqueRequiredItems
+            ]
+        );
+
+        // ---------------------------------------------------------
+        // Convert inventory into a lookup
+        // ---------------------------------------------------------
+
+        const ownedMap = new Map();
+
+        for (const row of ownedRows) {
+            ownedMap.set(
+                String(row.item_id),
+                Number(row.quantity) || 0
+            );
+        }
+
+        // ---------------------------------------------------------
+        // Make sure player owns EVERY required ingredient
+        // ---------------------------------------------------------
+
+        const missingItem = uniqueRequiredItems.find(itemId => {
+            return (ownedMap.get(itemId) || 0) < 1;
+        });
+
+        if (missingItem) {
+            await connection.rollback();
+
+            return res.status(400).json({
+                error: {
+                    code: 'RECIPE_ITEM_NOT_OWNED'
+                }
+            });
+        }
+
+        // ---------------------------------------------------------
+        // Get and LOCK the result item
+        // ---------------------------------------------------------
+
+        const [resultRows] = await connection.execute(
+            `
+            SELECT quantity
+            FROM owned_items
+            WHERE player_id = ?
+              AND item_id = ?
+            FOR UPDATE
+            `,
+            [
+                player_id,
+                resultId
+            ]
+        );
+
+        const currentResultQuantity = resultRows.length
+            ? Number(resultRows[0].quantity) || 0
+            : 0;
+
+        // ---------------------------------------------------------
+        // Check MAX ITEM LIMIT
+        // ---------------------------------------------------------
+
+        if (currentResultQuantity >= MAX_ITEM_LIMIT) {
+            await connection.rollback();
+
+            return res.status(400).json({
+                error: {
+                    code: 'ITEM_LIMIT_REACHED'
+                }
+            });
+        }
+
+        // ---------------------------------------------------------
+        // Consume one of each ingredient
+        // NEVER DELETE - set quantity to 0 instead
+        // ---------------------------------------------------------
+
+        for (const itemId of uniqueRequiredItems) {
+            const currentQuantity = ownedMap.get(itemId);
+
+            const newQuantity = currentQuantity - 1;
+
+            await connection.execute(
+                `
+                UPDATE owned_items
+                SET quantity = ?
+                WHERE player_id = ?
+                  AND item_id = ?
+                `,
+                [
+                    newQuantity,
+                    player_id,
+                    itemId
+                ]
+            );
+
+            // Update our in-memory inventory so the response
+            // contains the quantities AFTER crafting.
+            ownedMap.set(itemId, newQuantity);
+        }
+
+        // ---------------------------------------------------------
+        // Add crafted item
+        // ---------------------------------------------------------
+
+        const newResultQuantity = currentResultQuantity + 1;
+
+        if (resultRows.length) {
+            await connection.execute(
+                `
+                UPDATE owned_items
+                SET quantity = ?
+                WHERE player_id = ?
+                  AND item_id = ?
+                `,
+                [
+                    newResultQuantity,
+                    player_id,
+                    resultId
+                ]
+            );
+        } else {
+            await connection.execute(
+                `
+                INSERT INTO owned_items
+                    (player_id, item_id, quantity)
+                VALUES
+                    (?, ?, ?)
+                `,
+                [
+                    player_id,
+                    resultId,
+                    1
+                ]
+            );
+        }
+
+        // ---------------------------------------------------------
+        // Build owned_items AFTER crafting
+        // Only show required items that still have quantity > 0
+        // ---------------------------------------------------------
+
+        const responseOwnedItems = uniqueRequiredItems.map(itemId => ({
+            item_id: itemId,
+            quantity: ownedMap.get(itemId) || 0
+        }));
+
+        // ---------------------------------------------------------
+        // Commit everything
+        // ---------------------------------------------------------
+
+        await connection.commit();
+
+        // ---------------------------------------------------------
+        // Return response
+        // ---------------------------------------------------------
+
+        return res.status(200).json({
+            owned_items: responseOwnedItems,
+            result: {
+                type: 'ITEM',
+                item_id: resultId,
+                quantity: newResultQuantity,
+                amount_received: 1,
+                amount: 1
+            }
+        });
+
+    } catch (error) {
+
+        try {
+            await connection.rollback();
+        } catch (_) {}
+
+        console.error(
+            'Recipe processing error:',
+            error
+        );
+
+        return res.status(500).json({
+            error: {
+                code: 'RECIPE_USE_FAILED'
+            }
+        });
+
+    } finally {
+        connection.release();
+    }
+});
 
 
 
