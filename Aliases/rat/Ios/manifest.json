@@ -527,12 +527,6 @@
     "version": "5",
     "url": "https://assets.conspiracyrick.com/AssetBundles/AssetBundle-android:1011-ios:1011__7b175320/Ios/froopylandbundle2"
   },
-  "mpdata": {
-    "id": "mpdata",
-    "crc": "4099569620",
-    "version": "1050",
-    "url": "https://assets.conspiracyrick.com/AssetBundles/AssetBundle-android:1011-ios:1011__7b175320/Ios/mpdata"
-  },
   "preload": {
     "id": "preload",
     "crc": 2768894414,
@@ -694,18 +688,6 @@
     "crc": 3573946137,
     "version": "3",
     "url": "https://assets.conspiracyrick.com/AssetBundles/AssetBundle-android:1011-ios:1011__7b175320/Ios/psh027"
-  },
-  "spdata": {
-    "id": "spdata",
-    "crc": "56704220",
-    "version": "1045",
-    "url": "https://assets.conspiracyrick.com/AssetBundles/AssetBundle-android:1011-ios:1011__7b175320/Ios/spdata"
-  },
-  "text": {
-    "id": "text",
-    "crc": "1661817716",
-    "version": "1004",
-    "url": "https://assets.conspiracyrick.com/AssetBundles/AssetBundle-android:1011-ios:1011__7b175320/Ios/text"
   },
   "tg001": {
     "id": "tg001",
@@ -929,13 +911,17 @@
     "version": "1002",
     "url": "https://assets.conspiracyrick.com/AssetBundles/AssetBundle-android:1011-ios:1011__7b175320/Ios/v2.9.0"
   },
+  "iOS": {
+    "id": "iOS",
+    "crc": 4263613274,
+    "version": "1011",
+    "url": "https://assets.conspiracyrick.com/AssetBundles/AssetBundle-android:1011-ios:1011__7b175320/Ios/iOS"
+  },
   "assetBundleTags": {
     "preload": [
       "appdata",
-      "spdata",
-      "mpdata",
-      "text",
-      "preload"
+      "preload",
+      "iOS"
     ],
     "post_tutorial": [
       "au001",
@@ -1092,10 +1078,8 @@
     ],
     "everything": [
       "appdata",
-      "spdata",
-      "mpdata",
-      "text",
       "preload",
+      "iOS",
       "au001",
       "au002",
       "au003",
