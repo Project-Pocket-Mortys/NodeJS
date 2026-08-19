@@ -27,8 +27,10 @@ const pool = mysql.createPool({
     password: 'yourpassword',
     database: 'yourdb',
     waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
+    connectionLimit: 8,
+    queueLimit: 0,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 0
 });
 
 // ==================== CONFIGS & HELPERS ====================
@@ -748,7 +750,7 @@ app.post('/user/login', async (req, res) => {
         const tags = user.tags;
         
         const session_id = crypto.randomUUID(); 
-        const ping_url = 'https://game.conspiracyrick.com/session/ping-dynamic';
+        const ping_url = 'https://dev-game.conspiracyrick.com/session/ping-dynamic';
         
         const iat = Math.floor(Date.now() / 1000); 
         const exp = iat + 60; 
@@ -782,7 +784,7 @@ app.post('/user/login', async (req, res) => {
         const jwt = `${base64Header}.${base64Payload}.${base64Signature}`;
 
         const responseData = {
-            session_url: `https://game.conspiracyrick.com/sse/?token=${jwt}`,
+            session_url: `https://dev-game.conspiracyrick.com/sse/?token=${jwt}`,
             session_url_ttl: "60"
         };
 
@@ -878,7 +880,7 @@ app.get('/sse', async (req, res) => {
 
     const player_id = String(user.player_id);
     const tags = normalizeTags(user.tags);
-    const ping_url = String(profile?.ping_url || "https://game.conspiracyrick.com/session/ping-dynamic");
+    const ping_url = String(profile?.ping_url || "https://dev-game.conspiracyrick.com/session/ping-dynamic");
 
     // --- 1. REGISTER CONNECTION FOR DYNAMIC PING ROUTING ---
     activeSseConnections.set(player_id, sseSend);
@@ -3274,7 +3276,7 @@ app.post('/session/battle/ready', async (req, res) => {
         };
 
         // 6. Broadcast the clock frame to kick off the client UI clock tracking 
-        await sendPrivateSSE(roomId, "battle:move-timer-started", battlePayload, playerId);
+        await sendPrivateSSE(playerId, "battle:move-timer-started", battlePayload);
 
         return res.json({ success: true });
 
@@ -3434,7 +3436,7 @@ app.post('/session/battle/move', async (req, res) => {
             // CASE A: ITEM (CATCH)
             // ------------------------
             if (type === "ITEM" && moveId === "ItemMortyChip") {
-                const success = (Math.floor(Math.random() * 100) + 1) <= 50;
+                const success = (Math.floor(Math.random() * 100) + 1) <= 40;
 
                 // Retrieve updated item configuration
                 const [itemRows] = await pool.execute(
@@ -3504,7 +3506,6 @@ app.post('/session/battle/move', async (req, res) => {
                     await broadcastRoomSSE(roomId, "room:wild-morty-removed", { wild_morty_id: wildOwnedMortyId });
                     await broadcastRoomSSE(roomId, "room:wild-morty-added", { wild_morty: newWildMorty });
 
-                    outcome = "CAUGHT";
                     const newOwnedMortyId = crypto.randomUUID();
 
                     const newMorty = {
@@ -3581,7 +3582,7 @@ app.post('/session/battle/move', async (req, res) => {
 
                     }
 
-                    await sendPrivateSSE(roomId, "battle:turn-result", {
+                    await sendPrivateSSE(playerId, "battle:turn-result", {
                         battle_id: battleId,
                         outcome: "CAUGHT",
                         turn_datas: turnDatas,
@@ -3657,33 +3658,33 @@ app.post('/session/battle/move', async (req, res) => {
                     if (playerHp <= 0) {
                         outcome = "LOSE";
                     }
+					
+					// Evaluates for standard CONTINUE status updates
+					await sendPrivateSSE(playerId, "battle:turn-result", {
+                        battle_id: battleId,
+                        outcome: outcome,
+                        turn_datas: turnDatas,
+                        player_datas: {
+                            player: {
+                                owned_items: ownedItems,
+                                move_log: {
+                                    cooldown: {
+                                        ATTACK: 0
+                                    },
+                                    count: {
+                                        ATTACK: turnDatas.length
+                                    },
+                                    cooldown_next: {
+                                        ITEM: 1
+                                    },
+                                    last_move_type: type
+                                }
+                            },
+                            opponent: {}
+                        }
+                    }, playerId);
+					
                 }
-
-                // Evaluates for standard CONTINUE status updates
-                await sendPrivateSSE(roomId, "battle:turn-result", {
-                    battle_id: battleId,
-                    outcome: outcome,
-                    turn_datas: turnDatas,
-                    player_datas: {
-                        player: {
-                            owned_items: ownedItems,
-                            move_log: {
-                                cooldown: {
-                                    ATTACK: 0
-                                },
-                                count: {
-                                    ATTACK: turnDatas.length
-                                },
-                                cooldown_next: {
-                                    ITEM: 1
-                                },
-                                last_move_type: type
-                            }
-                        },
-                        opponent: {}
-                    }
-                }, playerId);
-
 
             }
 
@@ -3761,7 +3762,7 @@ app.post('/session/battle/move', async (req, res) => {
                         outcome = "LOSE";
                     }
 
-                    await sendPrivateSSE(roomId, "battle:turn-result", {
+                    await sendPrivateSSE(playerId, "battle:turn-result", {
                         battle_id: battleId,
                         outcome: outcome,
                         turn_datas: turnDatas,
@@ -3829,32 +3830,36 @@ app.post('/session/battle/move', async (req, res) => {
                 wildPayload.state = "WORLD";
                 wildPayload._updated = new Date().toISOString();
 				
-                await sendPrivateSSE(roomId, "battle:turn-result", {
-                    battle_id: battleId,
-                    outcome: "RUN",
-                    turn_datas: turnDatas,
-                    player_datas: {
-                        player: {
-                            attacks_to_learn: [],
-                            move_log: {
-                                cooldown: {
-                                    ATTACK: 0,
-                                    RUN: 0
-                                },
-                                count: {
-                                    ATTACK: turnDatas.length,
-                                    RUN: 1
-                                },
-                                cooldown_next: {
-                                    ITEM: 1
-                                },
-                                last_move_type: type
-                            }
-                        },
-                        opponent: {}
+await sendPrivateSSE(
+    playerId,
+    "battle:turn-result",
+    {
+        battle_id: battleId,
+        outcome: "RUN",
+        turn_datas: turnDatas,
+        player_datas: {
+            player: {
+                attacks_to_learn: [],
+                move_log: {
+                    cooldown: {
+                        ATTACK: 0,
+                        RUN: 0
                     },
-                    battle_abandoned: true
-                }, playerId);
+                    count: {
+                        ATTACK: turnDatas.length,
+                        RUN: 1
+                    },
+                    cooldown_next: {
+                        ITEM: 1
+                    },
+                    last_move_type: type
+                }
+            },
+            opponent: {}
+        },
+        battle_abandoned: true
+    }
+);
 				
 				await broadcastRoomSSE(roomId, "room:wild-morty-state-changed", {
                     wild_morty_id: wildOwnedMortyId,
@@ -5390,23 +5395,26 @@ app.post('/session/battle-bot', async (req, res) => {
             return res.status(409).json({ success: false, error: "Room does not exist", room_id: roomId });
         }
 
-        // 3. Extract the wild entity target instance from the event queue log map
-        const [botRows] = await pool.execute(`
-            SELECT bot_id, username, morty_id, player_avatar_id, owned_morties, placement, state, division, variant, shiny_if_potion 
-            FROM event_queue 
-            WHERE room_id = ? 
-              AND event_name = 'room:bot-added' 
-              AND bot_id = ? 
-            ORDER BY id DESC LIMIT 1
-        `, [roomId, botIdInput]);
+// 3. Find the bot directly from the in-memory SpawnedBots Map
+const roomBots = SpawnedBots.get(roomId);
 
-        if (!botRows.length) {
-            return res.status(409).json({ success: false, error: "Bot does not exist" });
-        }
+if (!roomBots) {
+    return res.status(409).json({
+        success: false,
+        error: "No bots found in room"
+    });
+}
 
-        const botPayload = botRows[0];
+const botPayload = roomBots.find(
+    bot => String(bot.bot_id) === botIdInput
+);
 
-
+if (!botPayload) {
+    return res.status(409).json({
+        success: false,
+        error: "Bot does not exist"
+    });
+}
         // Safely parse owned_morties (handles string, array, undefined, null)
         let morties = [];
         try {
@@ -5482,23 +5490,52 @@ app.post('/session/battle-bot', async (req, res) => {
         const ownedMortyIds = ownedMortiesRows.map(m => m.owned_morty_id);
         const placeholders = ownedMortyIds.map(() => '?').join(',');
         
-        const [attackRows] = await pool.execute(`
-            SELECT owned_morty_id, attacks_array
-            FROM owned_morties 
-            WHERE owned_morty_id IN (${placeholders}) 
-            ORDER BY owned_morty_id ASC, position ASC
-        `, ownedMortyIds);
+const [attackRows] = await pool.execute(`
+    SELECT owned_morty_id, attacks_array
+    FROM owned_morties
+    WHERE owned_morty_id IN (${placeholders})
+    ORDER BY owned_morty_id ASC
+`, ownedMortyIds);
 
-        for (const a of attackRows) {
-            const oid = a.owned_morty_id;
-            if (!attacksByOwnedMorty[oid]) attacksByOwnedMorty[oid] = [];
-            attacksByOwnedMorty[oid].push({
-                attack_id: a.attack_id,
-                position: parseInt(a.position, 10),
-                pp: parseInt(a.pp, 10),
-                pp_stat: parseInt(a.pp_stat, 10)
-            });
+for (const a of attackRows) {
+    const oid = a.owned_morty_id;
+
+    attacksByOwnedMorty[oid] = [];
+
+    try {
+        let attacks = a.attacks_array || [];
+
+        // MySQL JSON columns can come back as an object/array
+        // or as a JSON string depending on configuration.
+        if (typeof attacks === "string") {
+            attacks = JSON.parse(attacks);
         }
+
+        if (!Array.isArray(attacks)) {
+            attacks = [];
+        }
+
+        attacksByOwnedMorty[oid] = attacks
+            .map(attack => ({
+                attack_id: String(attack.attack_id || ""),
+                position: parseInt(attack.position ?? 0, 10),
+                pp: parseInt(attack.pp ?? 0, 10),
+                pp_stat: parseInt(
+                    attack.pp_stat ?? attack.pp ?? 0,
+                    10
+                )
+            }))
+            .sort((a, b) => a.position - b.position);
+
+    } catch (err) {
+        console.error(
+            `[BATTLE BOT] Failed to parse attacks for ${oid}:`,
+            err
+        );
+
+        attacksByOwnedMorty[oid] = [];
+    }
+}
 
         // 7. Establish the lead living fighter index
         let activeOwnedMorty = "";
@@ -5607,17 +5644,22 @@ const opponentPayload = {
 		
 		const battleType = "PvB";
 
-        await pool.execute(`
-            INSERT INTO battles (
-                battle_id, battle_type, player_id, bot_id, 
-                opponent_active_morty, opponent_morty_id, opponent_hp, 
-                player_active_morty, player_hp, state, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', NOW())
-        `, [
-            battleId, battleType, playerId, botIdInput,
-            opponentActiveMortyId, opponentMortyTemplateId, opponentHpValue,
-            playerActiveMortyId, playerHpValue
-        ]);
+Battles.set(battleId, {
+    battle_id: battleId,
+    battle_type: battleType,
+    player_id: playerId,
+    bot_id: botIdInput,
+
+    opponent_active_morty: opponentActiveMortyId,
+    opponent_morty_id: opponentMortyTemplateId,
+    opponent_hp: opponentHpValue,
+
+    player_active_morty: playerActiveMortyId,
+    player_hp: playerHpValue,
+
+    state: "ACTIVE",
+    created_at: new Date().toISOString()
+});
 
         // 12. Broadcast operational synchronization signals to SSE lines
         const finalBroadcastPayload = {
@@ -5628,7 +5670,7 @@ const opponentPayload = {
             meta: {}
         };
         
-        await sendPrivateSSE(roomId, "battle:start", finalBroadcastPayload, playerId);
+        await sendPrivateSSE(playerId, "battle:start", finalBroadcastPayload);
         await broadcastRoomSSE(roomId, "room:bot-state-changed", { bot_id: botIdInput, state: "BATTLE" });
         //await broadcastRoomSSE(roomId, "room:user-state-changed", { player_id: playerId, state: "BATTLE" });
 
