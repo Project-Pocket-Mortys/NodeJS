@@ -12,6 +12,24 @@ const SpawnedMorties = new Map();
 const SpawnedItems = new Map();
 const SpawnedBots = new Map();
 const Battles = new Map();
+
+// UDP SERVER
+const udpPlayers            = new Map(); // sessionHex -> player object
+const playersByRoom         = new Map(); // roomId -> Map<sessionHex, player>
+const sessionHexToPlayerId  = new Map(); // sessionHex -> player_id (persists until SSE closes)
+const unknownSessionLog     = new Map(); // sessionHex -> last log timestamp
+const udpRateLimiter        = new Map(); // sessionHex -> { count, windowStart }
+const udpViolations         = new Map(); // sessionHex -> { strikes, lastStrike }
+
+const HEARTBEAT_INTERVAL_MS     = 2000;
+const STALE_TIMEOUT_MS          = 300000;   // 5 minutes idle
+const NAT_KEEPALIVE_INTERVAL_MS = 15000;
+const MAX_PACKETS_PER_SECOND    = 30;       // fine — client sends ~20/sec max
+const MAX_MOVE_PER_TICK         = 12;       // fine — accounts for normal movement
+const MAX_STRIKES_BEFORE_KICK   = 8;        // was 2 — needs room for network jitter
+const STRIKE_RESET_MS           = 30000;    // 30s clean play resets count
+
+const pickupsInProgress = new Set();
 const app = express();
 // Middleware to parse JSON body
 app.use(express.json());
@@ -23,9 +41,9 @@ const toBool = (val) => val === true || val === 1 || String(val).toLowerCase() =
 // ---------------- 1. DATABASE CONFIGURATION ----------------
 const pool = mysql.createPool({
     host: 'localhost',
-    user: 'yourusername',
-    password: 'yourpassword',
-    database: 'yourdb',
+    user: 'tn2ml0mim8',
+    password: 'NyAgcFS01q2v9E[W',
+    database: 'pocket_mortys',
     waitForConnections: true,
     connectionLimit: 8,
     queueLimit: 0,
@@ -366,88 +384,88 @@ setInterval(async () => {
 
         for (const player of stalePlayers) {
             const player_id = String(player.player_id);
-            const room_id = String(player.room_id);
-
-            //console.log(`[Timeout!] Player ${player_id} has timed out from room ${room_id}.`);
-
-// ============================================================
-// RETURN ANY WILD MORTIES BELONGING TO THIS TIMED-OUT PLAYER
-// ============================================================
-
-if (typeof Battles !== 'undefined' && Battles instanceof Map) {
-
-    for (const battle of Battles.keys()) {
-
-        // Battles stores the entire battle object as the Map key
-        if (!battle || typeof battle !== 'object') {
-            continue;
-        }
-
-        // Only Wild Morty battles
-        if (String(battle.battle_type || "") !== "PvWM") {
-            continue;
-        }
-
-        const battlePlayerId = String(
-            battle.meta?.player_id || ""
-        );
-
-        // This battle does not belong to the timed-out player
-        if (battlePlayerId !== player_id) {
-            continue;
-        }
-
-        const battleRoomId = String(
-            battle.meta?.room_id || room_id
-        );
-
-        const wildMortyId = String(
-            battle.meta?.wild_morty_id || ""
-        );
-
-        //console.log(`[Timeout!] Player ${player_id} had Wild Morty ${wildMortyId} ` + `in battle ${battle.battle_id}. Returning Morty to WORLD.`);
-
-        // Get the Morties currently spawned in that room
-        const roomMorties = SpawnedMorties.get(battleRoomId);
-
-        if (roomMorties && wildMortyId) {
-
-            const wildPayload = roomMorties.find(
-                m => String(m.wild_morty_id) === wildMortyId
-            );
-
-            if (wildPayload) {
-
-                // Return the Morty to the WORLD state
-                wildPayload.state = "WORLD";
-                wildPayload._updated = new Date().toISOString();
-
-                SpawnedMorties.set(battleRoomId, roomMorties);
-
-                // Notify everyone currently in the room
-                await broadcastRoomSSE(
-                    battleRoomId,
-                    "room:wild-morty-state-changed",
-                    {
-                        wild_morty_id: wildMortyId,
-                        state: "WORLD"
-                    }
-                );
-
-                //console.log(`[Timeout!] Wild Morty ${wildMortyId} returned to WORLD ` + `in room ${battleRoomId}.`);
-
-            } else {
-                //console.warn(`[Timeout!] Wild Morty ${wildMortyId} was not found ` + `in room ${battleRoomId}.`);
+            const room_id   = String(player.room_id);
+			
+			// ============================================================
+			// REMOVE PLAYER FROM LIVE UDP POSITION TRACKING
+			// ============================================================
+			if (
+                typeof livePlayerPositions !== 'undefined' &&
+                    livePlayerPositions instanceof Map
+            ) {
+               livePlayerPositions.delete(player_id);
             }
-        }
 
-        // Remove this battle from the Battles Map.
-        // Because the battle object itself is the key:
-        Battles.delete(battle);
+            if (typeof Battles !== 'undefined' && Battles instanceof Map) {
 
-        //console.log(`[Timeout!] Removed abandoned PvWM battle ${battle.battle_id}.`);
-    }
-}
+                // ============================================================
+                // RETURN ANY WILD MORTIES BELONGING TO THIS TIMED-OUT PLAYER
+                // ============================================================
+                for (const battle of Battles.keys()) {
+
+                    if (!battle || typeof battle !== 'object') continue;
+                    if (String(battle.battle_type || "") !== "PvWM") continue;
+
+                    const battlePlayerId = String(battle.meta?.player_id || "");
+                    if (battlePlayerId !== player_id) continue;
+
+                    const battleRoomId = String(battle.meta?.room_id || room_id);
+                    const wildMortyId  = String(battle.meta?.wild_morty_id || "");
+
+                    const roomMorties = SpawnedMorties.get(battleRoomId);
+                    if (roomMorties && wildMortyId) {
+                        const wildPayload = roomMorties.find(
+                            m => String(m.wild_morty_id) === wildMortyId
+                        );
+                        if (wildPayload) {
+                            wildPayload.state    = "WORLD";
+                            wildPayload._updated = new Date().toISOString();
+                            SpawnedMorties.set(battleRoomId, roomMorties);
+                            await broadcastRoomSSE(battleRoomId, "room:wild-morty-state-changed", {
+                                wild_morty_id: wildMortyId,
+                                state: "WORLD"
+                            });
+                        }
+                    }
+
+                    Battles.delete(battle);
+                }
+
+                // ============================================================
+                // RETURN ANY BOTS BELONGING TO THIS TIMED-OUT PLAYER
+                // ============================================================
+                for (const [pvbBattleId, pvbBattle] of Battles.entries()) {
+
+                    if (!pvbBattle || typeof pvbBattle !== "object") continue;
+                    if (pvbBattle.battle_type !== "PvB") continue;
+                    if (String(pvbBattle.player_id) !== player_id) continue;
+
+                    // Cancel the scheduled timeout — we're handling cleanup now
+                    if (pvbBattle.timeoutId) clearTimeout(pvbBattle.timeoutId);
+
+                    const pvbRoomId   = String(pvbBattle.room_id || room_id);
+                    const pvbRoomBots = SpawnedBots.get(pvbRoomId) || [];
+                    const staleBot    = pvbRoomBots.find(
+                        b => String(b.bot_id) === String(pvbBattle.bot_id)
+                    );
+
+                    if (staleBot) {
+                        staleBot.state    = "WORLD";
+                        staleBot._updated = new Date().toISOString();
+                    }
+
+                    await broadcastRoomSSE(pvbRoomId, "room:bot-state-changed", {
+                        bot_id: pvbBattle.bot_id,
+                        state: "WORLD"
+                    });
+                    await broadcastRoomSSE(pvbRoomId, "room:user-state-changed", {
+                        player_id: player_id,
+                        state: "WORLD"
+                    });
+
+                    Battles.delete(pvbBattleId);
+                }
+            }
 
             // ============================================================
             // 2. REMOVE THE PLAYER'S ROOM MAPPING / STATE
@@ -477,19 +495,20 @@ if (typeof Battles !== 'undefined' && Battles instanceof Map) {
             // ============================================================
             // 4. CLEAN UP SSE CONNECTION
             // ============================================================
-
-            if (
-                typeof activeSseConnections !== 'undefined' &&
-                activeSseConnections.has(player_id)
-            ) {
-                activeSseConnections.delete(player_id);
+            const staleConn = activeSseConnections.get(player_id);
+            if (staleConn) {
+                if (typeof staleConn.kick === "function") {
+                    staleConn.kick("session_expired");
+                } else {
+                    activeSseConnections.delete(player_id);
+                }
             }
         }
 
     } catch (err) {
         console.error("[Timeout Worker Error]:", err.message);
     }
-}, 15000); // Runs every 15 seconds to sweep the database efficiently
+}, 15000);
 
 // ---------------- 2. UTILITIES & AUTHENTICATION HELPERS ----------------
 
@@ -618,7 +637,7 @@ function broadcastRoomSSE(roomId, eventName, payload, excludePlayerId = null) {
         let connectionPlayerId = null;
 
         for (const [playerId, connection] of activeSseConnections) {
-            if (connection === sseSend) {
+            if (connection === sseSend || connection?.sseSend === sseSend) {
                 connectionPlayerId = playerId;
                 break;
             }
@@ -641,11 +660,13 @@ function broadcastRoomSSE(roomId, eventName, payload, excludePlayerId = null) {
 }
 
 function sendPrivateSSE(playerId, eventName, payload) {
-    const sseSend = activeSseConnections.get(String(playerId));
+    const conn = activeSseConnections.get(String(playerId));
 
-    if (!sseSend) {
+    if (!conn) {
         return false;
     }
+
+    const sseSend = typeof conn === "function" ? conn : conn.sseSend;
 
     const data = typeof payload === "string"
         ? payload
@@ -658,6 +679,162 @@ function sendPrivateSSE(playerId, eventName, payload) {
         console.error(`Private SSE failed for ${playerId}:`, err);
         return false;
     }
+}
+
+// ============================================================
+// TRAINER LEVEL-UP FORMULA
+// To go from level N to N+1 requires N³ XP
+// xp = running total XP ever earned (never resets)
+// xp_lower = cumulative XP at the START of current level
+// xp_upper = cumulative XP needed to REACH next level
+//
+// Cumulative sum of cubes shortcut: 1³+2³+...+n³ = [n(n+1)/2]²
+// Level 1: lower=0,  upper=1
+// Level 2: lower=1,  upper=9
+// Level 3: lower=9,  upper=36
+// Level 4: lower=36, upper=100
+// Level 5: lower=100,upper=225
+// ============================================================
+const MAX_TRAINER_LEVEL = 50;
+
+function cumulativeXpToReach(level) {
+    if (level <= 0) return 0;
+    return Math.pow(level * (level + 1) / 2, 2);
+}
+
+function getTrainerXpThresholds(level) {
+    return {
+        xp_lower: cumulativeXpToReach(level - 1),
+        xp_upper: cumulativeXpToReach(level)
+    };
+}
+
+function calculateTrainerLevelUp(currentLevel, currentXp, xpEarned) {
+    let level = currentLevel;
+    let xp    = currentXp + xpEarned;
+    let { xp_lower, xp_upper } = getTrainerXpThresholds(level);
+    let didLevelUp = false;
+
+    while (xp >= xp_upper && level < MAX_TRAINER_LEVEL) {
+        level++;
+        didLevelUp = true;
+        ({ xp_lower, xp_upper } = getTrainerXpThresholds(level));
+    }
+
+    return { level, xp, xp_lower, xp_upper, didLevelUp };
+}
+
+// ============================================================
+// MORTY LEVEL-UP EXPERIENCE
+// ============================================================
+
+const MAX_MORTY_LEVEL = 100;
+
+// Morty XP uses cumulative cube thresholds.
+//
+// Level 1 = 0 XP
+// Level 2 = 8 XP
+// Level 3 = 27 XP
+// Level 4 = 64 XP
+// Level 5 = 125 XP
+// Level 6 = 216 XP
+// Level 7 = 343 XP
+// Level 8 = 512 XP
+//
+// XP is NEVER reset when a Morty levels up.
+// The client uses xp_lower/xp_upper to determine
+// the amount of XP displayed in the current level.
+
+// Total cumulative XP required to reach a level.
+function getMortyXpRequiredForLevel(level) {
+    if (level <= 1) return 0;
+
+    return Math.pow(level, 3);
+}
+
+
+// CONFIRMED from real game SSE data:
+// xp_lower = level³  |  xp_upper = (level+1)³
+// xp = cumulative total XP ever earned — never resets on level up
+function calculateMortyLevelAndBounds(currentLevel, currentXp, xpEarned) {
+    const totalXp  = currentXp + xpEarned;
+    let level      = currentLevel;
+    let didLevelUp = false;
+
+    while (level < MAX_MORTY_LEVEL) {
+        if (totalXp >= Math.pow(level + 1, 3)) {
+            level++;
+            didLevelUp = true;
+        } else {
+            break;
+        }
+    }
+
+    if (level >= MAX_MORTY_LEVEL) level = MAX_MORTY_LEVEL;
+
+    return {
+        level,
+        xp:       totalXp,
+        xp_lower: Math.pow(level, 3),
+        xp_upper: Math.pow(level + 1, 3),
+        didLevelUp
+    };
+}
+
+
+// Keep this helper if other parts of the server call it.
+function calculateMortyLevelUp(currentLevel, currentXp, xpEarned) {
+    return calculateMortyLevelAndBounds(
+        currentLevel,
+        currentXp,
+        xpEarned
+    );
+}
+
+function calculateLevelModifier(attackerLevel, defenderLevel) {
+    const rawModifier = 1.0 - 0.25 * (attackerLevel - defenderLevel);
+    return Math.max(0.2, Math.min(1.0, rawModifier));
+}
+
+function calculateBattleXp(attacker, defender, battleType = 'wild') {
+    // Wild Modifier: 1.0 for Wild, 1.5 for Trainer
+    const wildModifier = (battleType === 'trainer') ? 1.5 : 1.0;
+    
+    const levelModifier = calculateLevelModifier(attacker.level, defender.level);
+
+    // Official core formula calculation
+    const rawXp = (defender.base_xp * defender.level / 7.0) * levelModifier * wildModifier;
+
+    return Math.floor(rawXp);
+}
+
+function distributeBattleXp(attackerList, defender, battleType = 'wild') {
+    const baseEarnedXp = calculateBattleXp(attackerList[0], defender, battleType);
+    const results = [];
+
+    if (attackerList.length === 1) {
+        results.push({ mortyId: attackerList[0].id, xp: baseEarnedXp });
+    } else if (attackerList.length === 2) {
+        results.push({ mortyId: attackerList[0].id, xp: Math.floor(baseEarnedXp * 0.75) }); // Finisher
+        results.push({ mortyId: attackerList[1].id, xp: Math.floor(baseEarnedXp * 0.25) }); // Swapped
+    } else {
+        // 3 or more participants (2:1:1 split model)
+        results.push({ mortyId: attackerList[0].id, xp: Math.floor(baseEarnedXp * 0.50) }); // Finisher
+        for (let i = 1; i < attackerList.length; i++) {
+            results.push({ mortyId: attackerList[i].id, xp: Math.floor(baseEarnedXp * 0.25) });
+        }
+    }
+
+    return results;
+}
+
+// Calculates total cumulative XP required to reach a specific level from level 1
+function getTotalXpForLevel(level) {
+    let total = 0;
+    for (let l = 1; l < level; l++) {
+        total += getMortyXpRequiredForLevel(l + 1);
+    }
+    return total;
 }
 
 app.post('/trading/config', (req, res) => {
@@ -750,7 +927,7 @@ app.post('/user/login', async (req, res) => {
         const tags = user.tags;
         
         const session_id = crypto.randomUUID(); 
-        const ping_url = 'https://dev-game.conspiracyrick.com/session/ping-dynamic';
+        const ping_url = 'https://game.conspiracyrick.com/session/ping-dynamic';
         
         const iat = Math.floor(Date.now() / 1000); 
         const exp = iat + 60; 
@@ -784,7 +961,7 @@ app.post('/user/login', async (req, res) => {
         const jwt = `${base64Header}.${base64Payload}.${base64Signature}`;
 
         const responseData = {
-            session_url: `https://dev-game.conspiracyrick.com/sse/?token=${jwt}`,
+            session_url: `https://game.conspiracyrick.com/sse/?token=${jwt}`,
             session_url_ttl: "60"
         };
 
@@ -829,11 +1006,10 @@ app.post('/session/ping-dynamic', async (req, res) => {
             );
 
             // 3. Extract the active stream and push the session:keep-alive event directly down the pipe
-            const targetSseSend = activeSseConnections.get(player_id);
-            if (targetSseSend) {
-                // event: session:keep-alive
-                // data: 0
-                targetSseSend("session:keep-alive", "0");
+            const conn = activeSseConnections.get(player_id);
+            if (conn) {
+                const sseSend = typeof conn === "function" ? conn : conn.sseSend;
+                sseSend("session:keep-alive", "0");
             }
         }
 
@@ -880,10 +1056,12 @@ app.get('/sse', async (req, res) => {
 
     const player_id = String(user.player_id);
     const tags = normalizeTags(user.tags);
-    const ping_url = String(profile?.ping_url || "https://dev-game.conspiracyrick.com/session/ping-dynamic");
+    const ping_url = String(profile?.ping_url || "https://game.conspiracyrick.com/session/ping-dynamic");
 
     // --- 1. REGISTER CONNECTION FOR DYNAMIC PING ROUTING ---
-    activeSseConnections.set(player_id, sseSend);
+    const sessionHex = session_id.replaceAll("-", "");
+    activeSseConnections.set(player_id, { sseSend, kick: null });
+    sessionHexToPlayerId.set(sessionHex, player_id);
 
     const sessionPayload = {
         player_id,
@@ -912,11 +1090,20 @@ app.get('/sse', async (req, res) => {
     let room_id = "";
     let connectionActive = true;
 
+    // Wire up kick now that connectionActive is declared
+    const kick = (reason = "kicked") => {
+        if (!connectionActive) return;
+        sseSend("error", JSON.stringify({ error: reason }));
+        res.end(); // triggers req.on('close') which cleans up the maps
+    };
+    activeSseConnections.get(player_id).kick = kick;
+
     // --- 2. CLEAN UP REGISTRY MAP ON CLOSE ---
     req.on('close', () => {
         connectionActive = false;
 
         activeSseConnections.delete(player_id);
+        sessionHexToPlayerId.delete(sessionHex);
 
         const roomConnections = activeRoomSseConnections.get(room_id);
 
@@ -1113,17 +1300,18 @@ app.post('/session/player-details', async (req, res) => {
         return res.json({
             player_id: String(user.player_id),
             username: user.username,
-            player_avatar_id: user.player_avatar_id || 'AvatarRickDefault',
-            level: parseInt(user.level, 10),
-            xp: parseInt(user.xp, 10),
-            streak: parseInt(user.streak, 10),
-            coins: parseInt(user.coins, 10),
-            coupons: parseInt(user.coupons, 10),
-            permits: parseInt(user.permits, 10),
+            player_avatar_id: user.player_avatar_id,
+            level: parseInt(user.level),
+            xp: parseInt(user.xp),
+            streak: parseInt(user.streak),
+            coins: parseInt(user.coins),
+            coupons: parseInt(user.coupons),
+            permits: parseInt(user.permits),
             challenge_reward: false,
             owned_morties: ownedMorties,
-            active_deck_id: parseInt(user.active_deck_id, 10),
-            decks_owned: parseInt(user.decks_owned, 10),
+			morty_slots: user.morty_slots,
+            active_deck_id: parseInt(user.active_deck_id),
+            decks_owned: parseInt(user.decks_owned),
             decks: decks,
             owned_items: itemRows,
             owned_avatars: avatars,
@@ -1200,7 +1388,7 @@ app.post('/session/friend/list', async (req, res) => {
             friends: friends.map(formatPlayerNode),
             poll_period: 5,
             donation_request: { morty_id: null, next_countdown: 0, donation: null },
-            limit_friends: 30
+            limit_friends: 100
         };
 
         return res.json(result);
@@ -1458,7 +1646,7 @@ app.post('/session/friend/response', async (req, res) => {
             // Echo literal '1' string
             return res.status(200).send('1');
         }
-
+        /*
         // Reject = delete the pending request row
         await pool.query(
             `DELETE FROM friend_list
@@ -1470,7 +1658,7 @@ app.post('/session/friend/response', async (req, res) => {
              LIMIT 1`,
             [senderPlayerId, myPlayerId, myPlayerId, senderPlayerId]
         );
-
+        */
         // Echo literal '1' string
         return res.status(200).send('1');
 
@@ -1973,7 +2161,8 @@ const previousRoomId = previousRoomRows.length
 
 const newRoomId = String(room_id);
 
-const playerSse = activeSseConnections.get(String(player_id));
+const playerConn = activeSseConnections.get(String(player_id));
+const playerSse  = playerConn ? (typeof playerConn === "function" ? playerConn : playerConn.sseSend) : null;
 
 if (
     previousRoomId !== "" &&
@@ -2293,50 +2482,63 @@ app.post('/inappdeletion/request-account-deletion', (req, res) => {
 
 // -------------------- UPDATE PLAYER STATE --------------------
 app.post('/session/state', async (req, res) => {
-    // Match the headers from your PHP setup
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Access-Control-Allow-Origin', '*');
 
     const session_id = req.body.session_id ? String(req.body.session_id) : '';
-    const new_state = req.body.state ? String(req.body.state) : '';
+    const requested_state = req.body.state ? String(req.body.state).toUpperCase() : '';
 
-    // Validation check for standard required parameters
-    if (session_id === '' || new_state === '') {
-        return res.status(400).json({ 
-            error: "Bad Request. Missing session_id or state parameters." 
+    // Only allow known server states
+    const VALID_STATES = new Set([
+        'OCCUPIED',
+        'BATTLE',
+        'WORLD'
+    ]);
+
+    if (!session_id || !VALID_STATES.has(requested_state)) {
+        return res.status(400).json({
+            error: "Invalid session_id or state"
         });
     }
 
     try {
-        // 1. Fetch the user's current identity, room mapping, and state from the database
+        // Find the authenticated player and their ACTUAL current state
         const user = await requireUserBySession(session_id);
+
         const player_id = String(user.player_id);
-        const current_db_state = String(user.state || '');
         const room_id = String(user.room_id || '');
+        const current_state = String(user.state || '').toUpperCase();
 
-        // 2. Check if the incoming state is different from what the database says
-        if (new_state !== current_db_state) {
-            
-            // Update the state in the users table
-            await pool.execute(
-                "UPDATE users SET state = ?, last_seen = NOW() WHERE player_id = ?",
-                [new_state, player_id]
-            );
-
-            // If the player is actively mapped to a valid room shard, broadcast the change to the SSE queue
-            if (room_id && room_id !== "0" && room_id !== "") {
-                await broadcastRoomSSE(
-                    room_id, 
-                    "room:user-state-changed", 
-                    { player_id: player_id, state: new_state }, 
-                    player_id
-                );
-            }
+        // Nothing changed.
+        // Do NOT touch the database and do NOT broadcast SSE.
+        if (requested_state === current_state) {
+            return res.json({
+                state: current_state
+            });
         }
 
-        // 3. Mirror the original PHP output format exactly back to the client
+        // State is different, so update it.
+        await pool.execute(
+            `UPDATE users
+             SET state = ?, last_seen = NOW()
+             WHERE player_id = ?`,
+            [requested_state, player_id]
+        );
+
+        // Only broadcast after the database update succeeded.
+        if (room_id && room_id !== '0') {
+            await broadcastRoomSSE(
+                room_id,
+                "room:user-state-changed",
+                {
+                    player_id: player_id,
+                    state: requested_state
+                }
+            );
+        }
+
         return res.json({
-            state: new_state
+            state: requested_state
         });
 
     } catch (err) {
@@ -2345,8 +2547,9 @@ app.post('/session/state', async (req, res) => {
                 error: "Not authenticated"
             });
         }
-        
+
         console.error("[State API] Server Error:", err.message);
+
         return res.status(500).json({
             error: "SERVER_ERROR"
         });
@@ -2521,75 +2724,121 @@ app.post('/session/collect-pickup', async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
 
     const sessionId = req.body.session_id ? String(req.body.session_id) : "";
-    const pickupId = req.body.pickup_id ? String(req.body.pickup_id) : "";
+    const pickupId  = req.body.pickup_id  ? String(req.body.pickup_id)  : "";
 
     if (!sessionId || !pickupId) {
         return res.status(400).json({ error: "Missing session_id or pickup_id" });
     }
 
+    // Block concurrent requests for the same pickup before touching the DB at all
+    if (pickupsInProgress.has(pickupId)) {
+        return res.status(409).json({ error: { code: "PICKUP_IN_PROGRESS" } });
+    }
+    pickupsInProgress.add(pickupId);
+
     const connection = await pool.getConnection();
 
     try {
-        await connection.beginTransaction();
-
         // 1. Resolve player and room context
         const [playerRows] = await connection.execute(`
-            SELECT player_id, room_id FROM users 
-            WHERE session_id = ? LIMIT 1 FOR UPDATE
+            SELECT player_id, room_id FROM users
+            WHERE session_id = ? LIMIT 1
         `, [sessionId]);
 
         if (!playerRows.length) {
-            throw new Error("Invalid session");
+            return res.status(401).json({ error: "Invalid session" });
         }
 
-        const playerId = playerRows[0].player_id;
-        const roomId = String(playerRows[0].room_id);
+        const playerId = String(playerRows[0].player_id);
+        const roomId   = String(playerRows[0].room_id);
 
-        // 2. Locate and remove the pickup from the in-memory SpawnedItems Map
+        // 2. Find pickup in memory — don't remove yet
         const roomItems = SpawnedItems.get(roomId);
         if (!roomItems) {
-            throw new Error("Room items not found in memory");
+            return res.status(409).json({ error: { code: "ROOM_NOT_FOUND" } });
         }
 
         let collectedPickup = null;
 
         if (roomItems instanceof Map) {
-            collectedPickup = roomItems.get(pickupId);
-            if (collectedPickup) {
-                roomItems.delete(pickupId);
-            }
+            collectedPickup = roomItems.get(pickupId) || null;
         } else if (Array.isArray(roomItems)) {
-            const index = roomItems.findIndex(p => String(p.pickup_id) === pickupId);
-            if (index !== -1) {
-                collectedPickup = roomItems[index];
-                roomItems.splice(index, 1);
-            }
+            collectedPickup = roomItems.find(p => String(p.pickup_id) === pickupId) || null;
         } else if (typeof roomItems === 'object') {
-            collectedPickup = roomItems[pickupId];
-            if (collectedPickup) {
-                delete roomItems[pickupId];
-            }
+            collectedPickup = roomItems[pickupId] || null;
         }
 
         if (!collectedPickup) {
-            throw new Error("Pickup already collected or missing");
+            return res.status(409).json({ error: { code: "PICKUP_ALREADY_COLLECTED" } });
         }
 
-        const contents = collectedPickup.contents || [];
+        // 3. Proximity check
+        const MAX_PICKUP_DISTANCE = 5;
+        const livePos = livePlayerPositions.get(playerId);
 
-        // 3. Disburse items/currencies to player in DB (Fully checks existing stack limits & rows)
-        const results = [];
-        for (const reward of contents) {
-            if (reward.type === "ITEM") {
-                const itemResult = await grantItem(connection, playerId, reward.item_id, parseInt(reward.amount, 10));
-                results.push(itemResult);
-            } else if (reward.type === "COIN") {
-                const coinResult = await grantCoins(connection, playerId, parseInt(reward.amount, 10));
-                results.push(coinResult);
+        if (!livePos) {
+            return res.status(403).json({ error: { code: "POSITION_UNKNOWN" } });
+        }
+
+        const [pickupX, pickupY] = collectedPickup.placement;
+        const dx       = livePos.x - pickupX;
+        const dy       = livePos.y - pickupY;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+
+        if (distance > MAX_PICKUP_DISTANCE) {
+            console.warn(`[PROXIMITY BLOCK] Player ${playerId} at [${livePos.x},${livePos.y}] tried to collect pickup at [${pickupX},${pickupY}] dist=${distance.toFixed(2)}`);
+            return res.status(403).json({ error: { code: "TOO_FAR_FROM_PICKUP" } });
+        }
+
+        // 4. Transaction with deadlock retry
+        // In-memory removal happens AFTER commit so retries can still find the pickup
+        const contents = collectedPickup.contents || [];
+        let results    = [];
+
+        const MAX_RETRIES = 3;
+        let attempt      = 0;
+
+        while (attempt < MAX_RETRIES) {
+            try {
+                await connection.beginTransaction();
+
+                for (const reward of contents) {
+                    if (reward.type === "ITEM") {
+                        results.push(await grantItem(connection, playerId, reward.item_id, parseInt(reward.amount, 10)));
+                    } else if (reward.type === "COIN") {
+                        results.push(await grantCoins(connection, playerId, parseInt(reward.amount, 10)));
+                    }
+                }
+
+                await connection.commit();
+                break; // success
+
+            } catch (txErr) {
+                await connection.rollback();
+                results = []; // reset for retry
+
+                if (txErr.code === "ER_LOCK_DEADLOCK" && attempt < MAX_RETRIES - 1) {
+                    attempt++;
+                    console.warn(`[PICKUP] Deadlock on attempt ${attempt}, retrying in ${50 * attempt}ms...`);
+                    await new Promise(r => setTimeout(r, 50 * attempt));
+                    continue;
+                }
+
+                throw txErr; // not a deadlock or out of retries — bubble up
             }
         }
 
-        // 4. Generate a brand new replacement pickup using your exact config rules
+        // 5. Commit succeeded — NOW remove from memory
+        if (roomItems instanceof Map) {
+            roomItems.delete(pickupId);
+        } else if (Array.isArray(roomItems)) {
+            const index = roomItems.findIndex(p => String(p.pickup_id) === pickupId);
+            if (index !== -1) roomItems.splice(index, 1);
+        } else if (typeof roomItems === 'object') {
+            delete roomItems[pickupId];
+        }
+
+        // 6. Generate replacement pickup
         const currentPlacements = [];
         if (roomItems instanceof Map) {
             for (const item of roomItems.values()) {
@@ -2606,18 +2855,16 @@ app.post('/session/collect-pickup', async (req, res) => {
         }
 
         const availablePlacements = PICKUP_PLACEMENTS.filter(p => !currentPlacements.includes(p.join(',')));
-        const placementSource = availablePlacements.length > 0 ? availablePlacements : PICKUP_PLACEMENTS;
-        const chosenPlacement = placementSource[Math.floor(Math.random() * placementSource.length)];
+        const placementSource     = availablePlacements.length > 0 ? availablePlacements : PICKUP_PLACEMENTS;
+        const chosenPlacement     = placementSource[Math.floor(Math.random() * placementSource.length)];
 
-        const isCrate = Math.random() < PICKUPS_CONFIG.crate.probability;
+        const isCrate    = Math.random() < PICKUPS_CONFIG.crate.probability;
         const newPickupId = `${isCrate ? 'crate' : 'pickup'}_${Date.now()}_${Math.floor(Math.random() * 1000)}_${getRandomInt(100, 999)}`;
         const newContents = [];
 
         if (isCrate) {
+            newContents.push({ type: "COIN", amount: getRandomInt(PICKUPS_CONFIG.crate.coins_min, PICKUPS_CONFIG.crate.coins_max) });
             const itemCount = getRandomInt(PICKUPS_CONFIG.crate.contains_min, PICKUPS_CONFIG.crate.contains_max);
-            const coins = getRandomInt(PICKUPS_CONFIG.crate.coins_min, PICKUPS_CONFIG.crate.coins_max);
-            
-            newContents.push({ type: "COIN", amount: coins });
             for (let c = 0; c < itemCount; c++) {
                 const item = getWeightedRandom(PICKUPS_CONFIG.crate.contents);
                 newContents.push({ type: item.type, amount: item.amount, item_id: item.item_id, rarity: item.rarity });
@@ -2630,10 +2877,10 @@ app.post('/session/collect-pickup', async (req, res) => {
         const newPickupPayload = {
             pickup_id: String(newPickupId),
             placement: [Number(chosenPlacement[0]), Number(chosenPlacement[1])],
-            contents: newContents
+            contents:  newContents
         };
 
-        // 5. Insert the new replacement pickup directly into the SpawnedItems Map
+        // 7. Add replacement to memory
         if (roomItems instanceof Map) {
             roomItems.set(newPickupId, newPickupPayload);
         } else if (Array.isArray(roomItems)) {
@@ -2642,34 +2889,19 @@ app.post('/session/collect-pickup', async (req, res) => {
             roomItems[newPickupId] = newPickupPayload;
         }
 
-        // 6. Broadcast removal and addition marker payloads update messages
-        await broadcastRoomSSE(roomId, "room:pickup-removed", {
-            pickup_id: pickupId
-        });
-
+        // 8. Broadcast
+        await broadcastRoomSSE(roomId, "room:pickup-removed", { pickup_id: pickupId });
         await broadcastRoomSSE(roomId, "room:pickup-added", newPickupPayload);
 
-        // Commit transaction atomic balance states across tables cleanly
-        await connection.commit();
+        return res.json({ pickup_id: pickupId, contents: results });
 
-        return res.json({
-            pickup_id: pickupId,
-            contents: results
-        });
+    } catch (err) {
+        try { await connection.rollback(); } catch (_) {}
+        console.error(">>> [COLLECT PICKUP EXCEPTION]:", err.message);
+        return res.status(500).json({ error: "Server error", detail: err.message });
 
-    } catch (transactionError) {
-        try {
-            await connection.rollback();
-        } catch (rollbackErr) {
-            console.error("Rollback failed:", rollbackErr);
-        }
-
-        console.error(">>> [COLLECT PICKUP EXCEPTION]:", transactionError.message);
-        return res.status(500).json({
-            error: "Server error",
-            detail: transactionError.message
-        });
     } finally {
+        pickupsInProgress.delete(pickupId); // always release the lock
         connection.release();
     }
 });
@@ -2777,8 +3009,9 @@ app.post('/event/check', async (req, res) => {
 				const payloadStr = JSON.stringify(payload);
 				
 				// --- 2. IMMEDIATE REAL-TIME SSE EMIT ---
-                const sseSend = activeSseConnections.get(player_id);
-                if (sseSend) {
+                const conn = activeSseConnections.get(player_id);
+                if (conn) {
+                    const sseSend = typeof conn === "function" ? conn : conn.sseSend;
                     sseSend("shard:raid-boss-state-changed", payloadStr);
                 }
 				
@@ -2991,7 +3224,7 @@ app.post('/session/battle-wild-morty', async (req, res) => {
         );
 
         if (!wildPayload) {
-            //console.log(`[PvWM] Morty ${wildMortyIdInput} does not exist in room ${roomId}`);
+            console.log(`${playerId} attemped to battle ${wildMortyIdInput} but it does not exist in room ${roomId}`);
 
             return res.status(409).json({
                 success: false,
@@ -3006,6 +3239,12 @@ app.post('/session/battle-wild-morty', async (req, res) => {
                 error: "Morty is already in battle"
             });
         }
+		
+		// Immediately lock it in memory
+		wildPayload.state = "BATTLE";
+		wildPayload._updated = new Date().toISOString();
+		
+		await broadcastRoomSSE(roomId, "room:wild-morty-state-changed", { wild_morty_id: wildMortyIdInput, state: "BATTLE" });
 
         const extractedMortyTemplateId = wildPayload.morty_id;
 
@@ -3202,22 +3441,17 @@ app.post('/session/battle-wild-morty', async (req, res) => {
         };
         
         const payloadStr = JSON.stringify(finalBroadcastPayload);
-        const sseSend = activeSseConnections.get(playerId);
-        if (sseSend) {
+        const conn = activeSseConnections.get(playerId);
+        if (conn) {
+            const sseSend = typeof conn === "function" ? conn : conn.sseSend;
             sseSend("battle:start", payloadStr);
         }
 		
 		Battles.set(finalBroadcastPayload);
-            
-        await broadcastRoomSSE(roomId, "room:wild-morty-state-changed", { wild_morty_id: wildMortyIdInput, state: "BATTLE" });
-
-        // Immediately lock it in memory
-        wildPayload.state = "BATTLE";
-        wildPayload._updated = new Date().toISOString();
 
         SpawnedMorties.set(roomId, roomMorties);
 
-        //console.log(`[PvWM] ${wildMortyIdInput} locked as BATTLE in room ${roomId}`);
+        //console.log(`${playerRow.username} has started a battle with ${wildMortyIdInput} in room ${roomId}`);
 
         return res.json({ success: true });
 
@@ -3312,10 +3546,7 @@ app.post('/session/battle/move', async (req, res) => {
         // ========================
         // PLAYER LOOKUP
         // ========================
-        const [userRows] = await pool.execute(
-            "SELECT player_id, username, player_avatar_id, level, room_id, active_deck_id FROM users WHERE session_id = ? LIMIT 1",
-            [sessionId]
-        );
+        const [userRows] = await pool.execute("SELECT player_id, username, player_avatar_id, level, xp, xp_lower, xp_upper, room_id, active_deck_id FROM users WHERE session_id = ? LIMIT 1", [sessionId]);
         if (!userRows.length) {
             return res.status(401).json({
                 success: false
@@ -3577,8 +3808,7 @@ app.post('/session/battle/move', async (req, res) => {
                             level: level,
                             owned_morties: activeDeckArray,
                             state: "WORLD"
-                        }, playerId);
-
+                        });
 
                     }
 
@@ -3830,36 +4060,36 @@ app.post('/session/battle/move', async (req, res) => {
                 wildPayload.state = "WORLD";
                 wildPayload._updated = new Date().toISOString();
 				
-await sendPrivateSSE(
-    playerId,
-    "battle:turn-result",
-    {
-        battle_id: battleId,
-        outcome: "RUN",
-        turn_datas: turnDatas,
-        player_datas: {
-            player: {
-                attacks_to_learn: [],
-                move_log: {
-                    cooldown: {
-                        ATTACK: 0,
-                        RUN: 0
-                    },
-                    count: {
-                        ATTACK: turnDatas.length,
-                        RUN: 1
-                    },
-                    cooldown_next: {
-                        ITEM: 1
-                    },
-                    last_move_type: type
-                }
-            },
-            opponent: {}
-        },
-        battle_abandoned: true
-    }
-);
+                await sendPrivateSSE(
+                    playerId,
+                    "battle:turn-result",
+                    {
+                        battle_id: battleId,
+                        outcome: "RUN",
+                        turn_datas: turnDatas,
+                        player_datas: {
+                            player: {
+                                attacks_to_learn: [],
+                                move_log: {
+                                    cooldown: {
+                                        ATTACK: 0,
+                                        RUN: 0
+                                    },
+                                    count: {
+                                        ATTACK: turnDatas.length,
+                                        RUN: 1
+                                    },
+                                    cooldown_next: {
+                                        ITEM: 1
+                                    },
+                                    last_move_type: type
+                                }
+                            },
+                            opponent: {}
+                        },
+                        battle_abandoned: true
+                    }
+                );
 				
 				await broadcastRoomSSE(roomId, "room:wild-morty-state-changed", {
                     wild_morty_id: wildOwnedMortyId,
@@ -3880,6 +4110,7 @@ await sendPrivateSSE(
                     turn_datas: turnDatas,
                     player_datas: {
                         player: {
+							/*
                             player_xp_datas: {
                                 streak: 0,
                                 streak_old: 0,
@@ -3892,7 +4123,9 @@ await sendPrivateSSE(
                                     xp_upper: 64
                                 }]
                             },
+							*/
                             xp_datas: xpDatas,
+							/*
                             rewards: [{
                                 type: "ITEM",
                                 item_id: "ItemCircuitBoard",
@@ -3900,6 +4133,7 @@ await sendPrivateSSE(
                                 amount_received: 0,
                                 amount: 1
                             }],
+							*/
                             attacks_to_learn: [],
                             move_log: {
                                 cooldown: {
@@ -3978,6 +4212,348 @@ await sendPrivateSSE(
 			
 			Battles.delete(battleId);
         } // end of PvWM battle
+		
+if (battle.battle_type == "PvB") {
+    const getAiMove = () => {
+        const moves = ["AttackBatteringRam", "AttackVileSpew"];
+        return moves[Math.floor(Math.random() * moves.length)];
+    };
+
+    let outcome = "CONTINUE";
+    let turnDatas = [];
+    let xpDatas = [];
+
+    const aiMove = getAiMove();
+
+    // PvB battle uses flat fields, not nested player/opponent objects
+    const opponentId        = battle.bot_id;
+    const wildOwnedMortyId  = battle.opponent_active_morty;
+    const wildMortyId       = battle.opponent_morty_id;
+
+    let playerHp = battle.player_hp;
+    let enemyHp  = battle.opponent_hp;
+
+    // Verify the bot still exists in the room
+    const roomBots = SpawnedBots.get(roomId) || [];
+    const botPayload = roomBots.find(
+        b => String(b.bot_id) === String(battle.bot_id)
+    );
+    if (!botPayload) {
+        console.log(`[PvB] Bot ${battle.bot_id} does not exist in room ${roomId}`);
+        return res.status(409).json({ success: false, error: "Bot does not exist in this room" });
+    }
+
+    if (type === "ATTACK") {
+        const playerDamage = 20;
+        const aiDamage = Math.floor(Math.random() * (3 - 1 + 1)) + 1;
+
+        const enemyHpAfter  = Math.max(enemyHp - playerDamage, 0);
+        const playerHpAfter = Math.max(playerHp - aiDamage, 0);
+
+        // Step 1: Push Player Turn
+        turnDatas.push({
+            type: "ATTACK",
+            attacker_player_id: playerId,
+            defender_player_id: opponentId,
+            attack_id: moveId,
+            element_modifier: 1,
+            effect_datas: [{
+                type: "Hit",
+                is_accurate: true,
+                to_self: false,
+                continue_on_miss: false,
+                is_critical: false,
+                damage: playerDamage,
+                defender_morty_datas: [{
+                    owned_morty_id: wildOwnedMortyId,
+                    hp: enemyHpAfter
+                }]
+            }],
+            attacker_morty_datas: [{
+                owned_morty_id: ownedMortyId,
+                owned_attacks: [{
+                    attack_id: moveId,
+                    pp: Math.floor(Math.random() * 5) + 1
+                }]
+            }]
+        });
+
+        enemyHp = enemyHpAfter;
+
+        // Step 2: AI counter if still alive
+        if (enemyHp > 0) {
+            turnDatas.push({
+                type: "ATTACK",
+                attacker_player_id: opponentId,
+                defender_player_id: playerId,
+                attack_id: aiMove,
+                element_modifier: 1,
+                effect_datas: [{
+                    type: "Hit",
+                    is_accurate: true,
+                    to_self: false,
+                    continue_on_miss: false,
+                    is_critical: false,
+                    damage: aiDamage,
+                    defender_morty_datas: [{
+                        owned_morty_id: ownedMortyId,
+                        hp: playerHpAfter
+                    }]
+                }],
+                attacker_morty_datas: [{
+                    owned_morty_id: wildOwnedMortyId,
+                    owned_attacks: [{
+                        attack_id: aiMove,
+                        pp: 1
+                    }]
+                }]
+            });
+
+            playerHp = playerHpAfter;
+            if (playerHp <= 0) {
+                outcome = "LOSE";
+            }
+
+            await sendPrivateSSE(playerId, "battle:turn-result", {
+                battle_id: battleId,
+                outcome: outcome,
+                turn_datas: turnDatas,
+                player_datas: {
+                    player: {
+                        attacks_to_learn: [],
+                        move_log: {
+                            cooldown: { ATTACK: 0, RUN: 0 },
+                            count: { ATTACK: turnDatas.length, RUN: 1 },
+                            cooldown_next: { ITEM: 1 },
+                            last_move_type: type
+                        }
+                    },
+                    opponent: {}
+                },
+                battle_abandoned: true
+            });
+
+        } else {
+            // Enemy eliminated -> Process Victory Calculation
+            outcome = "WIN";
+
+            const [mortyRows] = await pool.execute(
+                `SELECT level, xp, hp_stat, attack_stat, defence_stat, speed_stat
+                 FROM owned_morties WHERE owned_morty_id = ? AND player_id = ? LIMIT 1`,
+                [ownedMortyId, playerId]
+            );
+
+            const currentMortyLevel  = mortyRows.length ? parseInt(mortyRows[0].level,        10) : 1;
+            const currentMortyXp     = mortyRows.length ? parseInt(mortyRows[0].xp,           10) : 0;
+            const currentHpStat      = mortyRows.length ? parseInt(mortyRows[0].hp_stat,      10) : 20;
+            const currentAttackStat  = mortyRows.length ? parseInt(mortyRows[0].attack_stat,  10) : 11;
+            const currentDefenceStat = mortyRows.length ? parseInt(mortyRows[0].defence_stat, 10) : 10;
+            const currentSpeedStat   = mortyRows.length ? parseInt(mortyRows[0].speed_stat,   10) : 10;
+
+            const attacker = { level: currentMortyLevel };
+            const defender = {
+                level:   botPayload?.owned_morties?.[0]?.level || 5,
+                base_xp: 64
+            };
+
+            const xpEarned = calculateBattleXp(attacker, defender, 'bot');
+
+            const updatedMortyProgress = calculateMortyLevelAndBounds(currentMortyLevel, currentMortyXp, xpEarned);
+
+            const levelDiff      = updatedMortyProgress.level - currentMortyLevel;
+            // Grow stats additively from current values — never reset to base
+            const newHpStat      = currentHpStat      + (levelDiff * 2);
+            const newAttackStat  = currentAttackStat  + (levelDiff * 4);
+            const newDefenceStat = currentDefenceStat + (levelDiff * 2);
+            const newSpeedStat   = currentSpeedStat   +  levelDiff;
+
+            await pool.execute(
+               `UPDATE owned_morties 
+               SET level = ?, xp = ?, xp_lower = ?, xp_upper = ?, hp_stat = ?, attack_stat = ?, defence_stat = ?, speed_stat = ? 
+               WHERE owned_morty_id = ? AND player_id = ?`,
+                [
+                    updatedMortyProgress.level,
+                    updatedMortyProgress.xp,
+                    updatedMortyProgress.xp_lower,
+                    updatedMortyProgress.xp_upper,
+                    newHpStat,
+                    newAttackStat,
+                    newDefenceStat,
+                    newSpeedStat,
+                    ownedMortyId,
+                    playerId
+                ]
+            );
+
+            // 3. Construct response `xpDatas` array matching client expectations
+            if (updatedMortyProgress.didLevelUp) {
+                //console.log(`[PvB LEVEL UP] Morty ${ownedMortyId} reached level ${updatedMortyProgress.level}`);
+            }
+
+            const mortyDataEntry = {
+                level:        updatedMortyProgress.level,
+                xp:           updatedMortyProgress.xp,
+                hp:           playerHp,
+                hp_stat:      newHpStat,
+                attack_stat:  newAttackStat,
+                defence_stat: newDefenceStat,
+                speed_stat:   newSpeedStat,
+                variant:      "Normal",
+                xp_lower:     updatedMortyProgress.xp_lower,
+                xp_upper:     updatedMortyProgress.xp_upper
+            };
+
+            xpDatas = [{
+                owned_morty_id: ownedMortyId,
+                xp_earned:      xpEarned,
+                owned_morty_datas: updatedMortyProgress.didLevelUp
+                    ? [
+                        // First entry: snapshot at the exact level-up threshold
+                        {
+                            ...mortyDataEntry,
+                            xp: updatedMortyProgress.xp_lower  // exactly level³
+                        },
+                        // Second entry: actual final XP after carry-over
+                        mortyDataEntry
+                    ]
+                    : [ mortyDataEntry ]
+            }];
+        }
+    }
+
+    // ========================
+    // COMMIT STATE TO STORAGE
+    // ========================
+    battle.player_hp   = playerHp;
+    battle.opponent_hp = enemyHp;
+
+    // ========================
+    // CONDITIONAL EMISSION PIPELINE
+    // ========================
+    if (type === "RUN") {
+        botPayload.state    = "WORLD";                          // was wildPayload — undefined in PvB
+        botPayload._updated = new Date().toISOString();
+
+        await sendPrivateSSE(playerId, "battle:turn-result", {
+            battle_id: battleId,
+            outcome: "RUN",
+            turn_datas: turnDatas,
+            player_datas: {
+                player: {
+                    attacks_to_learn: [],
+                    move_log: {
+                        cooldown: { ATTACK: 0, RUN: 0 },
+                        count: { ATTACK: turnDatas.length, RUN: 1 },
+                        cooldown_next: { ITEM: 1 },
+                        last_move_type: type
+                    }
+                },
+                opponent: {}
+            },
+            battle_abandoned: true
+        });
+
+        await broadcastRoomSSE(roomId, "room:bot-state-changed", {  // was room:wild-morty-state-changed
+            bot_id: battle.bot_id,
+            state: "WORLD"
+        });
+        await broadcastRoomSSE(roomId, "room:user-state-changed", {
+            player_id: playerId,
+            state: "WORLD"
+        });
+
+        Battles.delete(battleId);
+    }
+
+    if (outcome === "WIN") {
+        botPayload.state    = "WORLD";
+        botPayload._updated = new Date().toISOString();
+		
+		// Calculate real XP gain and level up
+        const XP_EARNED_PVB = 5;
+        const { level: newLevel, xp: newXp, xp_lower: newXpLower, xp_upper: newXpUpper, didLevelUp } = calculateTrainerLevelUp(
+            parseInt(userRows[0].level),
+            parseInt(userRows[0].xp),
+            XP_EARNED_PVB
+        );
+
+        // Persist new level/xp to DB
+        await pool.execute(
+            `UPDATE users SET level = ?, xp = ?, xp_lower = ?, xp_upper = ? WHERE player_id = ?`,
+            [newLevel, newXp, newXpLower, newXpUpper, playerId]
+        );
+
+        if (didLevelUp) {
+            //console.log(`[LEVEL UP] Player ${playerId} reached level ${newLevel} via PvB`);
+        }
+
+        sendPrivateSSE(playerId, "battle:turn-result", {
+            battle_id: battleId,
+            outcome: "WIN",
+            turn_datas: turnDatas,
+            player_datas: {
+                player: {
+                    player_xp_datas: {
+                        streak: 0,
+                        streak_old: 0,
+                        xp_earned: XP_EARNED_PVB,
+                        xp_multiplier: 0,
+                        player_datas: [{
+                            level:     newLevel,
+                            xp:        newXp,
+                            xp_lower:  newXpLower,
+                            xp_upper:  newXpUpper
+                        }]
+                    },
+                    xp_datas: xpDatas,
+                    rewards: [{
+                        type: "ITEM",
+                        item_id: "ItemCircuitBoard",
+                        quantity: 10,
+                        amount_received: 0,
+                        amount: 1
+                    }],
+                    attacks_to_learn: [],
+                    move_log: {
+                        cooldown: { ATTACK: 0 },
+                        count: { ATTACK: turnDatas.length },
+                        cooldown_next: { ITEM: 1 },
+                        last_move_type: type
+                    }
+                },
+                opponent: {}
+            }
+        });
+
+        await broadcastRoomSSE(roomId, "room:bot-state-changed", {
+            bot_id: battle.bot_id,
+            state: "WORLD"
+        });
+        await broadcastRoomSSE(roomId, "room:user-state-changed", {
+            player_id: playerId,
+            state: "WORLD"
+        });
+
+        Battles.delete(battleId);
+    }
+
+    if (outcome === "LOSE") {
+        botPayload.state    = "WORLD";
+        botPayload._updated = new Date().toISOString();
+
+        await broadcastRoomSSE(roomId, "room:bot-state-changed", {
+            bot_id: battle.bot_id,
+            state: "WORLD"
+        });
+        await broadcastRoomSSE(roomId, "room:user-state-changed", {
+            player_id: playerId,
+            state: "WORLD"
+        });
+
+        Battles.delete(battleId);
+    }
+
+} // end of PvB battle
 
         // ========================
         // FINAL COMPONENT RESPONSE
@@ -4217,7 +4793,7 @@ app.post('/session/dimensions/check-if-dimension-ftue-rewards-dispensed', async 
         // 2. Business logic check for dimension_id '5'
         if (dimension_id === '5') {
             return res.json({
-                dispensed: true
+                dispensed: false
             });
         }
         if (dimension_id === '6') {
@@ -4452,7 +5028,7 @@ app.post('/user/register', async (req, res) => {
                 await connection.execute(`
                     INSERT INTO users (secret, player_id, username, player_avatar_id, level, xp, streak, active_deck_id, decks_owned, tags, xp_lower, xp_upper, created_with_ip)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                `, [secret, player_id, username, avatar, '1', '27', '0', '0', '3', '[]', '27', '64', ip]);
+                `, [secret, player_id, username, avatar, '1', '0', '0', '0', '3', '[]', '0', '1', ip]);
 
                 // stmt_2: Map starting deck index structure
                 await connection.execute(`
@@ -7961,8 +8537,96 @@ app.post('/session/recipe/use', async (req, res) => {
     }
 });
 
+app.post('/session/morty/slots/buy', async (req, res) => {
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('X-Powered-By', 'Express');
+    res.setHeader('Access-Control-Allow-Origin', '*');
 
+    try {
+        const { session_id } = req.body;
 
+        if (!session_id) {
+            return res.status(400).json({
+                error: 'Missing session_id'
+            });
+        }
+		
+		// Find the player associated with this session
+        const [sessionRows] = await pool.execute(`
+            SELECT player_id, morty_slots, coupons
+            FROM users
+            WHERE session_id = ?
+            LIMIT 1
+        `, [session_id]);
+
+        if (!sessionRows.length) {
+            return res.status(401).json({
+                error: 'Invalid session'
+            });
+        }
+
+        const playerId = sessionRows[0].player_id;
+
+        if (!sessionRows.length) {
+            return res.status(404).json({
+                error: 'Player not found'
+            });
+        }
+
+        const currentSlots = Number(sessionRows[0].morty_slots);
+        const currentCoupons = Number(sessionRows[0].coupons);
+
+        const incrementSlotCount = 100;
+        const maxMortySlots = 750;
+        const costAdditionalSlot = 5;
+
+        // Already at maximum
+        if (currentSlots >= maxMortySlots) {
+            return res.status(400).json({
+                error: 'Maximum Morty storage reached'
+            });
+        }
+
+        // Not enough coupons
+        if (currentCoupons < costAdditionalSlot) {
+            return res.status(400).json({
+                error: 'Not enough coupons'
+            });
+        }
+
+        const newMortySlotsOwned = Math.min(
+            currentSlots + incrementSlotCount,
+            maxMortySlots
+        );
+
+        const newCoupons = currentCoupons - costAdditionalSlot;
+
+        // Save new values
+        await pool.execute(`
+            UPDATE users
+            SET morty_slots = ?,
+                coupons = ?
+            WHERE player_id = ?
+        `, [
+            newMortySlotsOwned,
+            newCoupons,
+            playerId
+        ]);
+
+        // Response
+        return res.json({
+            morty_slots: newMortySlotsOwned,
+            coupons: newCoupons
+        });
+
+    } catch (err) {
+        console.error('Error buying Morty storage slot:', err);
+
+        return res.status(500).json({
+            error: 'Internal server error'
+        });
+    }
+});
 
 
 
@@ -7980,13 +8644,37 @@ app.post('/session/recipe/use', async (req, res) => {
 
 
 // UDP SERVER
-const udpPlayers = new Map();       // sessionHex -> player object
-const playersByRoom = new Map();    // roomId -> Map<sessionHex, player>
+// ── Stale UDP session cleanup — runs every 30 seconds ──────────────────────
+setInterval(() => {
+    const now = Date.now();
+    for (const [sessionHex, player] of udpPlayers) {
+        if (now - player.lastSeen > STALE_TIMEOUT_MS) {
+            //console.log(`[UDP STALE] Removing ${player.playerId} (${Math.round((now - player.lastSeen) / 1000)}s idle)`);
+            kickPlayerBySessionHex(sessionHex); // ends their SSE stream
+            unregisterPlayerUdpSession(sessionHex);
+            livePlayerPositions.delete(player.playerId);
+        }
+    }
+}, 30000);
+
+// ── Clean up ancillary maps every 60 seconds ───────────────────────────────
+setInterval(() => {
+    const now = Date.now();
+    for (const [hex, ts] of unknownSessionLog) {
+        if (now - ts > 60000) unknownSessionLog.delete(hex);
+    }
+    for (const [hex, l] of udpRateLimiter) {
+        if (now - l.windowStart > 2000) udpRateLimiter.delete(hex);
+    }
+    for (const [hex, v] of udpViolations) {
+        if (now - v.lastStrike > STRIKE_RESET_MS * 2) udpViolations.delete(hex);
+    }
+}, 60000);
 
 function hexToUuid(hex) {
     return (
-        hex.substring(0, 8) + "-" +
-        hex.substring(8, 12) + "-" +
+        hex.substring(0, 8)  + "-" +
+        hex.substring(8, 12)  + "-" +
         hex.substring(12, 16) + "-" +
         hex.substring(16, 20) + "-" +
         hex.substring(20, 32)
@@ -7994,8 +8682,7 @@ function hexToUuid(hex) {
 }
 
 function registerPlayerUdpSession(playerId, sessionHex, roomId) {
-    // Precompute the 16-byte identity buffer ONCE — never redo this per-packet.
-    const idHex = playerId.replace(/-/g, "");
+    const idHex    = playerId.replace(/-/g, "");
     const idBuffer = Buffer.from(idHex, "hex");
 
     if (idBuffer.length !== 16) {
@@ -8005,16 +8692,18 @@ function registerPlayerUdpSession(playerId, sessionHex, roomId) {
 
     const player = {
         playerId,
-        idBuffer,        // precomputed, reused on every relay
+        idBuffer,
         roomId,
-        address: null,
-        port: null,
-        lastSeen: Date.now()
+        address:      null,
+        port:         null,
+        lastPacket:   null,
+        lastSeen:     Date.now(),
+        lastSequence: undefined
     };
 
     udpPlayers.set(sessionHex, player);
+    sessionHexToPlayerId.set(sessionHex, playerId); // reverse map for SSE kick
 
-    // Room index so relay loops never touch other rooms' players
     if (!playersByRoom.has(roomId)) {
         playersByRoom.set(roomId, new Map());
     }
@@ -8025,6 +8714,9 @@ function unregisterPlayerUdpSession(sessionHex) {
     const player = udpPlayers.get(sessionHex);
     if (!player) return;
     udpPlayers.delete(sessionHex);
+    // Intentionally NOT deleting from sessionHexToPlayerId —
+    // it stays alive so kickPlayerBySessionHex can still find the SSE stream.
+    // SSE req.on('close') clears it.
     const room = playersByRoom.get(player.roomId);
     if (room) {
         room.delete(sessionHex);
@@ -8037,13 +8729,13 @@ function decodePacket(buffer) {
         throw new Error(`Invalid packet size ${buffer.length}`);
     }
     return {
-        session: buffer.subarray(0, 16).toString("hex"),
-        sequence: buffer.readUInt16LE(16),
-        x: buffer.readUInt8(18),
-        xFlags: buffer.readUInt8(19),
-        y: buffer.readUInt8(20),
-        yFlags: buffer.readUInt8(21),
-        frame: buffer.readUInt8(22),
+        session:   buffer.subarray(0, 16).toString("hex"),
+        sequence:  buffer.readUInt16LE(16),
+        x:         buffer.readUInt8(18),
+        xFlags:    buffer.readUInt8(19),
+        y:         buffer.readUInt8(20),
+        yFlags:    buffer.readUInt8(21),
+        frame:     buffer.readUInt8(22),
         direction: buffer.readUInt8(23)
     };
 }
@@ -8053,29 +8745,141 @@ function relayMovement(idBuffer, target, msg) {
     udpServer.send(relayPacket, 0, relayPacket.length, target.port, target.address);
 }
 
+function kickPlayerBySessionHex(sessionHex) {
+    const playerId = sessionHexToPlayerId.get(sessionHex);
+    if (!playerId) return;
+    const conn = activeSseConnections.get(playerId);
+    if (!conn) return;
+    //console.log(`[UDP KICK] Stale session ${sessionHex} -> kicking ${playerId}`);
+    if (typeof conn.kick === "function") {
+        conn.kick("udp_session_invalid");
+    } else {
+        activeSseConnections.delete(playerId);
+    }
+}
+
+function checkUdpRateLimit(sessionHex) {
+    const now     = Date.now();
+    const limiter = udpRateLimiter.get(sessionHex);
+    if (!limiter || now - limiter.windowStart > 1000) {
+        udpRateLimiter.set(sessionHex, { count: 1, windowStart: now });
+        return false;
+    }
+    limiter.count++;
+    return limiter.count > MAX_PACKETS_PER_SECOND;
+}
+
+function addUdpStrike(sessionHex, reason, player) {
+    const now   = Date.now();
+    const entry = udpViolations.get(sessionHex) || { strikes: 0, lastStrike: now };
+    if (now - entry.lastStrike > STRIKE_RESET_MS) entry.strikes = 0;
+    entry.strikes++;
+    entry.lastStrike = now;
+    udpViolations.set(sessionHex, entry);
+    console.warn(`[UDP VIOLATION ${entry.strikes}/${MAX_STRIKES_BEFORE_KICK}] ${reason} | player=${player?.playerId}`);
+    if (entry.strikes >= MAX_STRIKES_BEFORE_KICK) {
+        //console.warn(`[UDP KICK] Strike limit reached for ${player?.playerId}`);
+        kickPlayerBySessionHex(sessionHex);
+        unregisterPlayerUdpSession(sessionHex);
+        livePlayerPositions.delete(player?.playerId);
+        udpViolations.delete(sessionHex);
+        udpRateLimiter.delete(sessionHex);
+        return true;
+    }
+    return false;
+}
+
 udpServer.on('message', (msg, rinfo) => {
     try {
-        const packet = decodePacket(msg);
-        const player = udpPlayers.get(packet.session);
-        if (!player) {
-            console.log("[UNKNOWN SESSION]", packet.session);
+        if (msg.length !== 24) {
+            console.warn(`[UDP INVALID] ${rinfo.address}:${rinfo.port} size=${msg.length}`);
             return;
         }
 
-        player.address = rinfo.address;
-        player.port = rinfo.port;
-        player.lastSeen = Date.now();
+        const packet = decodePacket(msg);
+        const player = udpPlayers.get(packet.session);
+
+        if (!player) {
+            const now      = Date.now();
+            const lastSeen = unknownSessionLog.get(packet.session) || 0;
+            if (now - lastSeen > 10000) {
+                console.log(`[UNKNOWN SESSION] ${packet.session} from=${rinfo.address}:${rinfo.port}`);
+                unknownSessionLog.set(packet.session, now);
+                kickPlayerBySessionHex(packet.session);
+            }
+            return;
+        }
+
+        // ── 1. RATE LIMIT ────────────────────────────────────────────────
+        if (checkUdpRateLimit(packet.session)) {
+            addUdpStrike(packet.session, `rate limit exceeded (>${MAX_PACKETS_PER_SECOND}/sec)`, player);
+            return;
+        }
+
+        // ── 2. SEQUENCE REPLAY DETECTION ────────────────────────────────
+        // Client uses a uint8 counter (0-255) so wrap threshold is 128 not 32768
+        if (player.lastSequence !== undefined) {
+            const delta = (packet.sequence - player.lastSequence + 256) % 256;
+            if (delta === 0) {
+                // Exact duplicate packet
+                const kicked = addUdpStrike(packet.session, `duplicate sequence ${packet.sequence}`, player);
+                if (kicked) return;
+                return;
+            }
+            if (delta > 128) {
+                // Sequence going backwards — replay attack
+                const kicked = addUdpStrike(packet.session, `sequence replay: got ${packet.sequence} after ${player.lastSequence}`, player);
+                if (kicked) return;
+                return;
+            }
+        }
+        player.lastSequence = packet.sequence;
+
+        // ── 3. COORDINATE BOUNDS ─────────────────────────────────────────
+        if (packet.x > 150 || packet.y > 150) {
+            const kicked = addUdpStrike(packet.session, `out-of-bounds coords [${packet.x},${packet.y}]`, player);
+            if (kicked) return;
+            return;
+        }
+
+        // ── 4. SPEED HACK DETECTION ──────────────────────────────────────
+		/*
+        const lastPos = livePlayerPositions.get(player.playerId);
+        if (lastPos) {
+            const dx = Math.abs(packet.x - lastPos.x);
+            const dy = Math.abs(packet.y - lastPos.y);
+            if (dx > MAX_MOVE_PER_TICK || dy > MAX_MOVE_PER_TICK) {
+                const kicked = addUdpStrike(
+                    packet.session,
+                    `speed hack: [${lastPos.x},${lastPos.y}] -> [${packet.x},${packet.y}] (${dx},${dy})`,
+                    player
+                );
+                if (kicked) return;
+                return;
+            }
+        }
+		*/
+
+        // ── 5. IP CHANGE LOG ─────────────────────────────────────────────
+        if (player.address && player.address !== rinfo.address) {
+            console.warn(`[UDP IP CHANGE] ${player.playerId}: ${player.address} -> ${rinfo.address}`);
+        }
+
+        // ── ALL CHECKS PASSED ─────────────────────────────────────────────
+        player.address    = rinfo.address;
+        player.port       = rinfo.port;
+        player.lastPacket = Buffer.from(msg);
+        player.lastSeen   = Date.now();
 
         livePlayerPositions.set(player.playerId, {
-            x: packet.x,
-            y: packet.y,
-            frame: packet.frame,
-            direction: packet.direction,
-            roomId: player.roomId,
+            x:           packet.x,
+            y:           packet.y,
+            frame:       packet.frame,
+            direction:   packet.direction,
+            roomId:      player.roomId,
             lastUpdated: Date.now()
         });
 
-        // Only scan players in the SAME room, not the whole server
         const roomPlayers = playersByRoom.get(player.roomId);
         if (!roomPlayers) return;
 
@@ -8084,10 +8888,41 @@ udpServer.on('message', (msg, rinfo) => {
             if (!target.address) continue;
             relayMovement(player.idBuffer, target, msg);
         }
+
     } catch (err) {
-        console.error("[UDP ERROR]", err);
+        console.error(`[UDP ERROR] ${rinfo.address}:${rinfo.port} ${err.message}`);
     }
 });
+
+// ── HEARTBEAT: keep idle players visible on other screens ──────────────────
+setInterval(() => {
+    const now = Date.now();
+    for (const roomPlayers of playersByRoom.values()) {
+        for (const player of roomPlayers.values()) {
+            if (!player.address || !player.lastPacket) continue;
+            if (now - player.lastSeen > STALE_TIMEOUT_MS) continue;
+            if (now - player.lastSeen < HEARTBEAT_INTERVAL_MS) continue;
+            for (const target of roomPlayers.values()) {
+                if (target === player) continue;
+                if (!target.address) continue;
+                relayMovement(player.idBuffer, target, player.lastPacket);
+            }
+        }
+    }
+}, HEARTBEAT_INTERVAL_MS);
+
+// ── NAT KEEPALIVE: prevent router from dropping idle UDP mappings ───────────
+setInterval(() => {
+    const now = Date.now();
+    for (const roomPlayers of playersByRoom.values()) {
+        for (const player of roomPlayers.values()) {
+            if (!player.address || !player.lastPacket) continue;
+            if (now - player.lastSeen > STALE_TIMEOUT_MS) continue;
+            if (now - player.lastSeen < NAT_KEEPALIVE_INTERVAL_MS) continue;
+            udpServer.send(player.lastPacket, 0, player.lastPacket.length, player.port, player.address);
+        }
+    }
+}, NAT_KEEPALIVE_INTERVAL_MS);
 
 udpServer.bind(13001, '0.0.0.0', () => {
     console.log("UDP Movement Engine listening on 13001");

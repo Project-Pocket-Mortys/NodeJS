@@ -385,7 +385,6 @@ CREATE TABLE `trade_offers` (
 
 CREATE TABLE `users` (
   `id` int UNSIGNED NOT NULL,
-  `dev` tinyint(1) NOT NULL DEFAULT '0',
   `banned` int NOT NULL DEFAULT '0',
   `recovery_code_hash` varchar(255) COLLATE utf8mb4_general_ci DEFAULT NULL,
   `secret` varchar(255) COLLATE utf8mb4_general_ci NOT NULL,
@@ -405,6 +404,7 @@ CREATE TABLE `users` (
   `losses` bigint NOT NULL DEFAULT '0',
   `active_deck_id` int DEFAULT NULL,
   `decks_owned` int DEFAULT '1',
+  `morty_slots` int NOT NULL DEFAULT '350',
   `tags` text COLLATE utf8mb4_general_ci,
   `xp_lower` bigint DEFAULT NULL,
   `xp_upper` bigint DEFAULT NULL,
