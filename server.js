@@ -13,22 +13,6 @@ const SpawnedItems = new Map();
 const SpawnedBots = new Map();
 const Battles = new Map();
 
-// UDP SERVER
-const udpPlayers            = new Map(); // sessionHex -> player object
-const playersByRoom         = new Map(); // roomId -> Map<sessionHex, player>
-const sessionHexToPlayerId  = new Map(); // sessionHex -> player_id (persists until SSE closes)
-const unknownSessionLog     = new Map(); // sessionHex -> last log timestamp
-const udpRateLimiter        = new Map(); // sessionHex -> { count, windowStart }
-const udpViolations         = new Map(); // sessionHex -> { strikes, lastStrike }
-
-const HEARTBEAT_INTERVAL_MS     = 2000;
-const STALE_TIMEOUT_MS          = 300000;   // 5 minutes idle
-const NAT_KEEPALIVE_INTERVAL_MS = 15000;
-const MAX_PACKETS_PER_SECOND    = 30;       // fine — client sends ~20/sec max
-const MAX_MOVE_PER_TICK         = 12;       // fine — accounts for normal movement
-const MAX_STRIKES_BEFORE_KICK   = 8;        // was 2 — needs room for network jitter
-const STRIKE_RESET_MS           = 30000;    // 30s clean play resets count
-
 const pickupsInProgress = new Set();
 const app = express();
 // Middleware to parse JSON body
@@ -41,9 +25,9 @@ const toBool = (val) => val === true || val === 1 || String(val).toLowerCase() =
 // ---------------- 1. DATABASE CONFIGURATION ----------------
 const pool = mysql.createPool({
     host: 'localhost',
-    user: 'tn2ml0mim8',
-    password: 'NyAgcFS01q2v9E[W',
-    database: 'pocket_mortys',
+    user: 'yourdbusername',
+    password: 'yourdbuserpassword',
+    database: 'yourdbpassword',
     waitForConnections: true,
     connectionLimit: 8,
     queueLimit: 0,
@@ -2321,6 +2305,16 @@ if (playerSse) {
                 state: u.state
             });
         }
+		
+        users.push({
+            player_id: "NaN",
+            username: "Twitch.TV/ConspiracyRick",
+            player_avatar_id: "AvatarRickEvil",
+            level: 100,
+            owned_morties: "",
+            state: "WORLD",
+			placement: [27, 34]
+        });
 
         const pickups = SpawnedItems.get(room_id) || populateRoomPickups(room_id);
         const wild_morties = SpawnedMorties.get(room_id) || populateRoomMorties(room_id);
@@ -2773,7 +2767,7 @@ app.post('/session/collect-pickup', async (req, res) => {
         }
 
         // 3. Proximity check
-        const MAX_PICKUP_DISTANCE = 5;
+        const MAX_PICKUP_DISTANCE = 8;
         const livePos = livePlayerPositions.get(playerId);
 
         if (!livePos) {
@@ -3523,6 +3517,242 @@ app.post('/session/battle/ready', async (req, res) => {
 // ============================================================================
 // ⚔️ ROUTE: PROCESS BATTLE TURN ACTION
 // ============================================================================
+const PVP_MOVE_TIMEOUT_MS = 30000;
+
+function getPvpMoveLog(battle, playerId) {
+    if (!battle.moveLogs) battle.moveLogs = {};
+    if (!battle.moveLogs[playerId]) {
+        battle.moveLogs[playerId] = {
+            cooldown:       {},
+            count:          {},
+            cooldown_next:  { ITEM: 1 },
+            last_move_type: {}
+        };
+    }
+    return battle.moveLogs[playerId];
+}
+
+function bumpPvpMoveLog(battle, playerId, moveType) {
+    const log = getPvpMoveLog(battle, playerId);
+
+    // Tick down existing cooldowns first
+    for (const k of Object.keys(log.cooldown)) {
+        if (log.cooldown[k] > 0) log.cooldown[k]--;
+    }
+
+    log.count[moveType]  = (log.count[moveType] || 0) + 1;
+    log.last_move_type   = moveType;
+
+    if (moveType === "ITEM") {
+        // ITEM cooldown doubles each use: 1, 2, 4, 8, 16
+        log.cooldown.ITEM      = log.cooldown_next.ITEM;
+        log.cooldown_next.ITEM = log.cooldown_next.ITEM * 2;
+    } else {
+        log.cooldown[moveType] = 0;
+    }
+
+    return log;
+}
+
+function pvpMortyFainted(m) {
+    return Number(m?.hp || 0) <= 0;
+}
+
+function pvpGetActive(side) {
+    return side.owned_morties.find(
+        m => String(m.owned_morty_id) === String(side.active_owned_morty)
+    );
+}
+
+function pvpHasLivingMorty(side) {
+    return side.owned_morties.some(m => !pvpMortyFainted(m));
+}
+
+function startPvpTurnTimer(battleId) {
+    const battle = Battles.get(battleId);
+    if (!battle || battle.state === "ENDED") return;
+
+    const p1 = String(battle.player.player_id);
+    const p2 = String(battle.opponent.player_id);
+
+    sendPrivateSSE(p1, "battle:move-timer-started", { battle_id: battleId, timeout: 30 });
+    sendPrivateSSE(p2, "battle:move-timer-started", { battle_id: battleId, timeout: 30 });
+
+    if (battle.turnTimeout) clearTimeout(battle.turnTimeout);
+
+    battle.turnTimeout = setTimeout(async () => {
+        const b = Battles.get(battleId);
+        if (!b || b.state === "ENDED") return;
+
+        // Anyone still owing a switch gets auto-switched to their first living morty
+        for (const side of [b.player, b.opponent]) {
+            const pid = String(side.player_id);
+            if (b.awaitingSwitch?.[pid]) {
+                const next = side.owned_morties.find(m => !pvpMortyFainted(m));
+                if (next) {
+                    side.active_owned_morty = String(next.owned_morty_id);
+                    delete b.awaitingSwitch[pid];
+                }
+            }
+        }
+
+        // Anyone who didn't submit gets an auto ATTACK
+        for (const side of [b.player, b.opponent]) {
+            const pid = String(side.player_id);
+            if (!b.pendingMoves[pid]) {
+                const active = pvpGetActive(side);
+                b.pendingMoves[pid] = {
+                    type:          "ATTACK",
+                    moveId:        active?.owned_attacks?.[0]?.attack_id || "AttackBatteringRam",
+                    ownedMortyId:  side.active_owned_morty,
+                    autoSubmitted: true
+                };
+            }
+        }
+
+        await resolvePvpTurn(battleId);
+    }, PVP_MOVE_TIMEOUT_MS);
+}
+
+async function resolvePvpTurn(battleId) {
+    const battle = Battles.get(battleId);
+    if (!battle) return;
+
+    if (battle.turnTimeout) {
+        clearTimeout(battle.turnTimeout);
+        battle.turnTimeout = null;
+    }
+
+    const p1Id = String(battle.player.player_id);
+    const p2Id = String(battle.opponent.player_id);
+
+    // Sort actors by the acting morty's speed — confirmed against real server data
+    const actors = [
+        { side: battle.player,   opp: battle.opponent, id: p1Id, move: battle.pendingMoves[p1Id] },
+        { side: battle.opponent, opp: battle.player,   id: p2Id, move: battle.pendingMoves[p2Id] }
+    ].sort((a, b) =>
+        Number(pvpGetActive(b.side)?.speed_stat || 0) -
+        Number(pvpGetActive(a.side)?.speed_stat || 0)
+    );
+
+    const turnDatas = [];
+    let   winnerId  = null;
+
+    for (const actor of actors) {
+        if (winnerId) break;
+        if (!actor.move) continue;
+
+        const attacker = pvpGetActive(actor.side);
+        const defender = pvpGetActive(actor.opp);
+
+        // Attacker got KO'd earlier this turn — they don't get to act
+        if (!attacker || pvpMortyFainted(attacker)) continue;
+
+        bumpPvpMoveLog(battle, actor.id, actor.move.type);
+
+        // Spend PP on the used attack
+        const usedAttack = attacker.owned_attacks?.find(
+            a => String(a.attack_id) === String(actor.move.moveId)
+        );
+        if (usedAttack) usedAttack.pp = Math.max(Number(usedAttack.pp || 0) - 1, 0);
+
+        // Defender already down — log a NONE and move on
+        if (!defender || pvpMortyFainted(defender)) {
+            turnDatas.push({
+                type:               "NONE",
+                attacker_player_id: actor.id,
+                defender_player_id: String(actor.opp.player_id)
+            });
+            continue;
+        }
+
+        const damage = 20;
+        defender.hp = Math.max(Number(defender.hp || 0) - damage, 0);
+
+        turnDatas.push({
+            type:               "ATTACK",
+            attacker_player_id: actor.id,
+            defender_player_id: String(actor.opp.player_id),
+            attack_id:          actor.move.moveId,
+            element_modifier:   1,
+            effect_datas: [{
+                type:        "Hit",
+                is_accurate: true,
+                to_self:     false,
+                is_critical: false,
+                damage:      damage,
+                defender_morty_datas: [{
+                    owned_morty_id: String(defender.owned_morty_id),
+                    hp:             defender.hp
+                }]
+            }],
+            attacker_morty_datas: [{
+                owned_morty_id: String(attacker.owned_morty_id),
+                owned_attacks:  attacker.owned_attacks || []
+            }]
+        });
+
+        if (defender.hp <= 0 && !pvpHasLivingMorty(actor.opp)) {
+            winnerId = actor.id;
+        }
+    }
+
+    // Flag whoever needs to switch
+    battle.awaitingSwitch = {};
+    if (!winnerId) {
+        for (const side of [battle.player, battle.opponent]) {
+            const active = pvpGetActive(side);
+            if (active && pvpMortyFainted(active) && pvpHasLivingMorty(side)) {
+                battle.awaitingSwitch[String(side.player_id)] = true;
+            }
+        }
+    }
+
+    // Outcome is per-player: your morty down = FORCE_SWITCH, theirs down = ASK_SWITCH
+    const outcomeFor = (forSide, otherSide) => {
+        if (winnerId) return String(forSide.player_id) === winnerId ? "WIN" : "LOSE";
+        if (battle.awaitingSwitch[String(forSide.player_id)])   return "FORCE_SWITCH";
+        if (battle.awaitingSwitch[String(otherSide.player_id)]) return "ASK_SWITCH";
+        return "CONTINUE";
+    };
+
+    const buildPayload = (forSide, otherSide) => ({
+        battle_id:  battleId,
+        outcome:    outcomeFor(forSide, otherSide),
+        turn_datas: turnDatas,
+        player_datas: {
+            player: {
+                active_owned_morty: forSide.active_owned_morty,
+                owned_morties:      forSide.owned_morties,
+                attacks_to_learn:   [],
+                move_log:           getPvpMoveLog(battle, String(forSide.player_id))
+            },
+            opponent: {
+                active_owned_morty: otherSide.active_owned_morty,
+                owned_morties:      otherSide.owned_morties,
+                move_log:           getPvpMoveLog(battle, String(otherSide.player_id))
+            }
+        }
+    });
+
+    await sendPrivateSSE(p1Id, "battle:turn-result", buildPayload(battle.player, battle.opponent));
+    await sendPrivateSSE(p2Id, "battle:turn-result", buildPayload(battle.opponent, battle.player));
+
+    battle.pendingMoves = {};
+    battle.turnNumber   = (battle.turnNumber || 0) + 1;
+
+    if (winnerId) {
+        battle.state = "ENDED";
+        if (battle.room_id) {
+            await broadcastRoomSSE(battle.room_id, "room:user-state-changed", { player_id: p1Id, state: "WORLD" });
+            await broadcastRoomSSE(battle.room_id, "room:user-state-changed", { player_id: p2Id, state: "WORLD" });
+        }
+        Battles.delete(battleId);
+    } else {
+        startPvpTurnTimer(battleId);
+    }
+}
+
 app.post('/session/battle/move', async (req, res) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -3606,7 +3836,11 @@ app.post('/session/battle/move', async (req, res) => {
 
         // Security check: Verify the authenticated player owns this active battle
         const battlePlayerId = battle.player_id || (battle.player && battle.player.player_id);
-        if (battlePlayerId && battlePlayerId !== playerId) {
+        const battlePlayerIds = battle.battle_type === "PvP"
+            ? [battle.player?.player_id, battle.opponent?.player_id].filter(Boolean).map(String)
+            : [String(battlePlayerId || "")];
+
+        if (battlePlayerIds.length && !battlePlayerIds.includes(String(playerId))) {
             return res.status(403).json({
                 success: false,
                 error: "Unauthorized battle access"
@@ -3619,6 +3853,194 @@ app.post('/session/battle/move', async (req, res) => {
                 success: false,
                 error: "Battle is no longer active"
             });
+        }
+		
+		if (battle.battle_type === "PvP") {
+            // Resolve the caller's side so attacks and switches update only that player's team.
+            const playerSide = String(battle.player?.player_id) === String(playerId)
+                ? battle.player
+                : battle.opponent;
+            const opponentSide = playerSide === battle.player
+                ? battle.opponent
+                : battle.player;
+            const requestedMortyId = ownedMortyId || moveId;
+            const mortyCannotBattle = (morty) => Number(morty.hp || 0) <= 0
+                || toBool(morty.dazzled)
+                || toBool(morty.is_dazzled)
+                || String(morty.status || "").toUpperCase() === "DAZZLED";
+            const activeMorty = playerSide.owned_morties.find(
+                morty => String(morty.owned_morty_id) === String(playerSide.active_owned_morty)
+            );
+            const isSwitchAction = ["SWITCH", "CHANGE_MORTY", "MORTY_SWITCH"].includes(type)
+                || (type === "MORTY" && requestedMortyId !== "");
+            const livingMorties = playerSide.owned_morties.filter(
+                morty => !mortyCannotBattle(morty)
+            );
+
+            if (!activeMorty || mortyCannotBattle(activeMorty)) {
+                if (!isSwitchAction) {
+                    return res.status(409).json({
+                        success: false,
+                        error: "FORCED_SWITCH",
+                        battle_id: battleId,
+                        owned_morties: livingMorties
+                    });
+                }
+            }
+
+            // ------------------------
+            // CASE A: SWITCH — resolves immediately as its own turn
+            // ------------------------
+            if (isSwitchAction) {
+                const nextMorty = playerSide.owned_morties.find(
+                    morty => String(morty.owned_morty_id) === String(requestedMortyId)
+                );
+
+                if (!nextMorty) {
+                    return res.status(409).json({ success: false, error: "Morty is not in this battle" });
+                }
+
+                if (mortyCannotBattle(nextMorty)) {
+                    return res.status(409).json({ success: false, error: "Morty cannot battle with zero HP" });
+                }
+
+                playerSide.active_owned_morty = String(nextMorty.owned_morty_id);
+
+                if (battle.awaitingSwitch) delete battle.awaitingSwitch[String(playerId)];
+                bumpPvpMoveLog(battle, String(playerId), "SWITCH");
+
+                const switchTurnDatas = [
+                    {
+                        type:               "SWITCH",
+                        attacker_player_id: String(playerId),
+                        defender_player_id: String(opponentSide.player_id),
+                        owned_morty_id:     String(nextMorty.owned_morty_id)
+                    },
+                    {
+                        type:               "NONE",
+                        attacker_player_id: String(opponentSide.player_id),
+                        defender_player_id: String(playerId)
+                    }
+                ];
+
+                const buildSwitchPayload = (forSide, otherSide) => ({
+                    battle_id:  battleId,
+                    outcome:    "CONTINUE",
+                    turn_datas: switchTurnDatas,
+                    player_datas: {
+                        player: {
+                            active_owned_morty: forSide.active_owned_morty,
+                            owned_morties:      forSide.owned_morties,
+                            move_log:           getPvpMoveLog(battle, String(forSide.player_id))
+                        },
+                        opponent: {
+                            active_owned_morty: otherSide.active_owned_morty,
+                            move_log:           getPvpMoveLog(battle, String(otherSide.player_id))
+                        }
+                    }
+                });
+
+                await sendPrivateSSE(String(battle.player.player_id),   "battle:turn-result",
+                    buildSwitchPayload(battle.player, battle.opponent));
+                await sendPrivateSSE(String(battle.opponent.player_id), "battle:turn-result",
+                    buildSwitchPayload(battle.opponent, battle.player));
+
+                // If nobody else still owes a switch, start the next move timer
+                const stillWaiting = Object.keys(battle.awaitingSwitch || {}).length > 0;
+                if (!stillWaiting) startPvpTurnTimer(battleId);
+
+                return res.json({
+                    success:            true,
+                    battle_id:          battleId,
+                    active_owned_morty: playerSide.active_owned_morty
+                });
+            }
+
+            // ------------------------
+            // CASE B: RUN ACTION (immediate — ends the battle)
+            // ------------------------
+            if (type === "RUN") {
+                if (battle.turnTimeout) {
+                    clearTimeout(battle.turnTimeout);
+                    battle.turnTimeout = null;
+                }
+
+                const runPayload = {
+                    battle_id: battleId,
+                    outcome: "RUN",
+                    turn_datas: [{
+                        type: "RUN",
+                        attacker_player_id: String(playerId)
+                    }],
+                    player_datas: { player: {}, opponent: {} },
+                    battle_abandoned: true
+                };
+
+                await sendPrivateSSE(battle.player.player_id, "battle:turn-result", runPayload);
+                await sendPrivateSSE(battle.opponent.player_id, "battle:turn-result", runPayload);
+
+                if (battle.room_id) {
+                    await broadcastRoomSSE(battle.room_id, "room:user-state-changed", {
+                        player_id: String(battle.player.player_id), state: "WORLD"
+                    });
+                    await broadcastRoomSSE(battle.room_id, "room:user-state-changed", {
+                        player_id: String(battle.opponent.player_id), state: "WORLD"
+                    });
+                }
+
+                Battles.delete(battleId);
+                return res.json({ success: true });
+            }
+
+            // ------------------------
+            // CASE C: ATTACK ACTION — buffered until BOTH players submit
+            // ------------------------
+            if (type === "ATTACK") {
+                if (!battle.pendingMoves) battle.pendingMoves = {};
+                if (battle.turnNumber === undefined) battle.turnNumber = 0;
+
+                const defendingMorty = opponentSide.owned_morties.find(
+                    morty => String(morty.owned_morty_id) === String(opponentSide.active_owned_morty)
+                );
+
+                if (!defendingMorty || mortyCannotBattle(defendingMorty)) {
+                    return res.status(409).json({
+                        success: false,
+                        error: "OPPONENT_FORCED_SWITCH",
+                        battle_id: battleId,
+                        owned_morties: opponentSide.owned_morties.filter(
+                            morty => !mortyCannotBattle(morty)
+                        )
+                    });
+                }
+
+                const myId       = String(playerId);
+                const opponentId = String(opponentSide.player_id);
+
+                // Guard against double-submitting in the same turn
+                if (battle.pendingMoves[myId]) {
+                    return res.json({ success: true, waiting: true, already_submitted: true });
+                }
+
+                battle.pendingMoves[myId] = {
+                    type:         "ATTACK",
+                    moveId:       moveId,
+                    ownedMortyId: ownedMortyId,
+                    submittedAt:  Date.now()
+                };
+
+                // Other player hasn't moved yet — hold the turn
+                if (!battle.pendingMoves[opponentId]) {
+                    console.log(`[PvP] ${myId} submitted, waiting for ${opponentId}`);
+                    return res.json({ success: true, waiting: true });
+                }
+
+                // Both moves are in — resolve the full turn
+                await resolvePvpTurn(battleId);
+                return res.json({ success: true });
+            }
+
+            return res.status(400).json({ success: false, error: "Unsupported PvP move" });
         }
 
         if (battle.battle_type == "PvWM") {
@@ -4744,6 +5166,16 @@ app.post('/session/room-details', async (req, res) => {
                 });
             }
         }
+		
+        usersPayload.push({
+            player_id: "NaN",
+            username: "Twitch.TV/ConspiracyRick",
+            player_avatar_id: "AvatarRickEvil",
+            level: 100,
+            owned_morties: "",
+            state: "WORLD",
+			placement: [27, 34]
+        });
 
         const pickups = SpawnedItems.get(roomId) || populateRoomPickups(roomId);
         const wild_morties = SpawnedMorties.get(roomId) || populateRoomMorties(roomId);
@@ -5971,26 +6403,45 @@ app.post('/session/battle-bot', async (req, res) => {
             return res.status(409).json({ success: false, error: "Room does not exist", room_id: roomId });
         }
 
-// 3. Find the bot directly from the in-memory SpawnedBots Map
-const roomBots = SpawnedBots.get(roomId);
+        // 3. Find the bot directly from the in-memory SpawnedBots Map
+        const roomBots = SpawnedBots.get(roomId);
 
-if (!roomBots) {
-    return res.status(409).json({
-        success: false,
-        error: "No bots found in room"
-    });
-}
+        if (!roomBots) {
+            return res.status(409).json({
+            success: false,
+            error: "No bots found in room"
+            });
+        }
 
-const botPayload = roomBots.find(
-    bot => String(bot.bot_id) === botIdInput
-);
+        const botPayload = roomBots.find(
+            bot => String(bot.bot_id) === botIdInput
+        );
 
-if (!botPayload) {
-    return res.status(409).json({
-        success: false,
-        error: "Bot does not exist"
-    });
-}
+        if (!botPayload) {
+            return res.status(409).json({
+                success: false,
+                error: "Bot does not exist"
+            });
+        }
+		
+		// Proximity check — player must be close enough to the bot to initiate battle
+        const MAX_BOT_BATTLE_DISTANCE = 8;
+        const playerPos = livePlayerPositions.get(playerId);
+
+        if (!playerPos) {
+            return res.status(403).json({ success: false, error: "Player position unknown — move first" });
+        }
+
+        const [botX, botY] = botPayload.placement;
+        const bdx = playerPos.x - botX;
+        const bdy = playerPos.y - botY;
+        const botDistance = Math.sqrt(bdx * bdx + bdy * bdy);
+
+        if (botDistance > MAX_BOT_BATTLE_DISTANCE) {
+            console.warn(`[PROXIMITY BLOCK] Player ${playerId} at [${playerPos.x},${playerPos.y}] tried to battle bot at [${botX},${botY}] dist=${botDistance.toFixed(2)}`);
+            return res.status(403).json({ success: false, error: "Too far from bot to initiate battle" });
+        }
+		
         // Safely parse owned_morties (handles string, array, undefined, null)
         let morties = [];
         try {
@@ -6066,52 +6517,52 @@ if (!botPayload) {
         const ownedMortyIds = ownedMortiesRows.map(m => m.owned_morty_id);
         const placeholders = ownedMortyIds.map(() => '?').join(',');
         
-const [attackRows] = await pool.execute(`
-    SELECT owned_morty_id, attacks_array
-    FROM owned_morties
-    WHERE owned_morty_id IN (${placeholders})
-    ORDER BY owned_morty_id ASC
-`, ownedMortyIds);
+        const [attackRows] = await pool.execute(`
+            SELECT owned_morty_id, attacks_array
+            FROM owned_morties
+            WHERE owned_morty_id IN (${placeholders})
+            ORDER BY owned_morty_id ASC
+        `, ownedMortyIds);
 
-for (const a of attackRows) {
-    const oid = a.owned_morty_id;
+        for (const a of attackRows) {
+            const oid = a.owned_morty_id;
 
-    attacksByOwnedMorty[oid] = [];
+            attacksByOwnedMorty[oid] = [];
 
-    try {
-        let attacks = a.attacks_array || [];
+            try {
+                let attacks = a.attacks_array || [];
 
-        // MySQL JSON columns can come back as an object/array
-        // or as a JSON string depending on configuration.
-        if (typeof attacks === "string") {
-            attacks = JSON.parse(attacks);
+                // MySQL JSON columns can come back as an object/array
+                // or as a JSON string depending on configuration.
+                if (typeof attacks === "string") {
+                    attacks = JSON.parse(attacks);
+                }
+
+                if (!Array.isArray(attacks)) {
+                    attacks = [];
+                }
+
+                attacksByOwnedMorty[oid] = attacks
+                    .map(attack => ({
+                        attack_id: String(attack.attack_id || ""),
+                        position: parseInt(attack.position ?? 0, 10),
+                        pp: parseInt(attack.pp ?? 0, 10),
+                        pp_stat: parseInt(
+                            attack.pp_stat ?? attack.pp ?? 0,
+                            10
+                        )
+                    }))
+                    .sort((a, b) => a.position - b.position);
+
+            } catch (err) {
+                console.error(
+                    `[BATTLE BOT] Failed to parse attacks for ${oid}:`,
+                    err
+                );
+
+                attacksByOwnedMorty[oid] = [];
+            }
         }
-
-        if (!Array.isArray(attacks)) {
-            attacks = [];
-        }
-
-        attacksByOwnedMorty[oid] = attacks
-            .map(attack => ({
-                attack_id: String(attack.attack_id || ""),
-                position: parseInt(attack.position ?? 0, 10),
-                pp: parseInt(attack.pp ?? 0, 10),
-                pp_stat: parseInt(
-                    attack.pp_stat ?? attack.pp ?? 0,
-                    10
-                )
-            }))
-            .sort((a, b) => a.position - b.position);
-
-    } catch (err) {
-        console.error(
-            `[BATTLE BOT] Failed to parse attacks for ${oid}:`,
-            err
-        );
-
-        attacksByOwnedMorty[oid] = [];
-    }
-}
 
         // 7. Establish the lead living fighter index
         let activeOwnedMorty = "";
@@ -6188,19 +6639,19 @@ for (const a of attackRows) {
             move_log: moveLog
         };
 
-// Grab the first Morty's owned_morty_id (or fallback to botIdInput)
-const activeOpponentMortyId = opponentOwnedMorties[0]?.owned_morty_id || botIdInput;
+        // Grab the first Morty's owned_morty_id (or fallback to botIdInput)
+        const activeOpponentMortyId = opponentOwnedMorties[0]?.owned_morty_id || botIdInput;
 
-const opponentPayload = {
-    player_id: botPayload.bot_id,
-    username: botPayload.username,
-    player_avatar_id: botPayload.player_avatar_id,
-    owned_morties: opponentOwnedMorties,
-    streak: 0,
-    shiny_if_potion: toBool(botPayload.shiny_if_potion || false),
-    _meta: { isPlayerInDB: false, isControlledByAI: true, isRaidBoss: false },
-    active_owned_morty: activeOpponentMortyId // Fixed here
-};
+        const opponentPayload = {
+            player_id: botPayload.bot_id,
+            username: botPayload.username,
+            player_avatar_id: botPayload.player_avatar_id,
+            owned_morties: opponentOwnedMorties,
+            streak: 0,
+            shiny_if_potion: toBool(botPayload.shiny_if_potion || false),
+            _meta: { isPlayerInDB: false, isControlledByAI: true, isRaidBoss: false },
+            active_owned_morty: activeOpponentMortyId // Fixed here
+        };
 
         // 11. Extract metadata and write state record into the battles engine tracker table
         const battleId = crypto.randomUUID();
@@ -6220,22 +6671,22 @@ const opponentPayload = {
 		
 		const battleType = "PvB";
 
-Battles.set(battleId, {
-    battle_id: battleId,
-    battle_type: battleType,
-    player_id: playerId,
-    bot_id: botIdInput,
+        Battles.set(battleId, {
+            battle_id: battleId,
+            battle_type: battleType,
+            player_id: playerId,
+            bot_id: botIdInput,
 
-    opponent_active_morty: opponentActiveMortyId,
-    opponent_morty_id: opponentMortyTemplateId,
-    opponent_hp: opponentHpValue,
+            opponent_active_morty: opponentActiveMortyId,
+            opponent_morty_id: opponentMortyTemplateId,
+            opponent_hp: opponentHpValue,
 
-    player_active_morty: playerActiveMortyId,
-    player_hp: playerHpValue,
+            player_active_morty: playerActiveMortyId,
+            player_hp: playerHpValue,
 
-    state: "ACTIVE",
-    created_at: new Date().toISOString()
-});
+            state: "ACTIVE",
+            created_at: new Date().toISOString()
+        });
 
         // 12. Broadcast operational synchronization signals to SSE lines
         const finalBroadcastPayload = {
@@ -6304,7 +6755,6 @@ app.post('/session/battle-boss', async (req, res) => {
 });
 
 
-// -------------------- PvF --------------------
 app.post('/session/battle-invite/create', async (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -6312,7 +6762,9 @@ app.post('/session/battle-invite/create', async (req, res) => {
   res.setHeader('X-Powered-By', 'Express');
 
   try {
-    const { session_id, opponent_player_id, battle_type } = req.body;
+    const session_id         = req.body?.session_id         || req.headers['session_id']         || "";
+    const opponent_player_id = req.body?.opponent_player_id || req.headers['opponent_player_id'] || "";
+    const battle_type        = req.body?.battle_type        || req.headers['battle_type']        || "";
 
     if (!session_id || !opponent_player_id || !battle_type) {
       return res.status(400).json({ success: false, error: 'Missing required fields' });
@@ -6469,7 +6921,7 @@ app.post('/session/battle-invite/create', async (req, res) => {
     };
 
     // 8. Publish the event to the room
-    await sendPrivateSSE(roomId, "battle-invite:received", eventpayload, opponent.player_id);
+    await sendPrivateSSE(String(opponent.player_id), "battle-invite:received", eventpayload);
 
     // 9. Return the full structured payload to the HTTP response
     res.json(payload);
@@ -6487,10 +6939,14 @@ app.post('/session/battle-invite/response', async (req, res) => {
   res.setHeader('X-Powered-By', 'Express');
 
   try {
-    const { session_id, token, accept } = req.body;
+    // Accept values from either body or headers — client sends as headers
+    const session_id = req.body?.session_id || req.headers['session_id'] || req.headers['Session-Id'] || "";
+    const token      = req.body?.token      || req.headers['token']      || req.headers['Authorization']?.replace('Bearer ', '') || "";
+    const acceptRaw  = req.body?.accept     ?? req.headers['accept'];
+    const accept     = acceptRaw === true || acceptRaw === 'true' || acceptRaw === 1 || acceptRaw === '1';
 
-    if (!session_id || !token || typeof accept !== 'boolean') {
-      return res.status(400).json({ success: false, error: 'Missing required fields or invalid types' });
+    if (!session_id || !token) {
+      return res.status(400).json({ success: false, error: 'Missing session_id or token' });
     }
 
     // 1. Verify and decode the JWT battle invite token
@@ -6512,11 +6968,10 @@ app.post('/session/battle-invite/response', async (req, res) => {
         return res.status(401).json({ success: false, error: "Not authenticated" });
     }
 
-    const responder = userRows[0];
+    const responder         = userRows[0];
     const responderPlayerId = String(responder.player_id);
-    const roomId = String(responder.room_id || "");
+    const roomId            = String(responder.room_id || "");
 
-    // Verify that the user responding matches the intended target of the invite
     if (responderPlayerId !== String(to_player_id)) {
         return res.status(403).json({ success: false, error: "Unauthorized to respond to this invite" });
     }
@@ -6525,7 +6980,7 @@ app.post('/session/battle-invite/response', async (req, res) => {
         return res.status(409).json({ success: false, error: "Player is not in a room" });
     }
 
-    // 3. Fetch sender details for the event payload mapping
+    // 3. Fetch sender details
     const [senderRows] = await pool.execute(
         "SELECT player_id, username, player_avatar_id, level FROM users WHERE player_id = ? LIMIT 1",
         [from_player_id]
@@ -6535,41 +6990,191 @@ app.post('/session/battle-invite/response', async (req, res) => {
     }
     const sender = senderRows[0];
 
-    // 4. Handle Acceptance vs Declination logic
+    // 4. DECLINED — notify sender and stop here
     if (!accept) {
-      // Publish decline event to the inviting player
-      const declineEventPayload = {
+      await sendPrivateSSE(String(from_player_id), "battle-invite:declined", {
         battle_invite_id: battle_invite_id
-      };
-
-      await sendPrivateSSE(roomId, "battle-invite:declined", declineEventPayload, from_player_id);
-
+      });
       return res.json({ success: true, accepted: false });
     }
 
-    // If accepted: Publish accepted event back to the sender
-    const acceptEventPayload = {
+    // 5. ACCEPTED — notify sender, then build and start the battle
+    await sendPrivateSSE(String(from_player_id), "battle-invite:accepted", {
       battle_invite_id: battle_invite_id,
-      battle_type: battle_type,
+      battle_type:      battle_type,
       opponent: {
         player_id: String(responder.player_id),
-        username: String(responder.username)
-      }
-    };
-
-    await sendPrivateSSE(roomId, "battle-invite:accepted", acceptEventPayload, from_player_id);
-
-    // Return successful response to responder including opponent profile details
-    res.json({
-      success: true,
-      accepted: true,
-      battle_invite_id: battle_invite_id,
-      battle_type: battle_type,
-      opponent: {
-        player_id: String(sender.player_id),
-        username: String(sender.username)
+        username:  String(responder.username)
       }
     });
+
+    // ── Load a full player payload (deck, morties, attacks) ────────────────
+    const loadPlayer = async (playerId, playerSessionId = null) => {
+        const [rows] = await pool.execute(
+            `SELECT player_id, username, player_avatar_id, level, xp, streak,
+                    coins, coupons, permits, xp_lower, xp_upper, active_deck_id, room_id, tags
+             FROM users
+             WHERE ${playerSessionId ? "session_id" : "player_id"} = ?
+             LIMIT 1`,
+            [playerSessionId || playerId]
+        );
+
+        const user = rows[0];
+        if (!user) return null;
+
+        const resolvedPlayerId = String(user.player_id);
+
+        const [deckRows] = await pool.execute(
+            `SELECT owned_morty_ids FROM decks WHERE player_id = ? AND deck_id = ? LIMIT 1`,
+            [resolvedPlayerId, user.active_deck_id ?? 0]
+        );
+
+        let deckIds = [];
+        try {
+            const rawIds = deckRows[0]?.owned_morty_ids;
+            deckIds = Array.isArray(rawIds) ? rawIds : JSON.parse(String(rawIds || "[]"));
+        } catch (e) {
+            deckIds = parseIdList(deckRows[0]?.owned_morty_ids);
+        }
+
+        deckIds = Array.isArray(deckIds) ? deckIds.map(String).filter(Boolean) : [];
+        if (!deckIds.length) return null;
+
+        const placeholders = deckIds.map(() => '?').join(',');
+        const [mortyRows] = await pool.execute(
+            `SELECT owned_morty_id, morty_id, level, xp, hp, hp_stat,
+                    attack_stat, defence_stat, speed_stat, variant,
+                    is_locked, is_trading_locked, fight_pit_id,
+                    evolution_points, xp_lower, xp_upper, attacks_array
+             FROM owned_morties
+             WHERE player_id = ? AND owned_morty_id IN (${placeholders})`,
+            [resolvedPlayerId, ...deckIds]
+        );
+
+        const mortiesById = new Map();
+        for (const row of mortyRows) {
+            let attacks = [];
+            try {
+                attacks = typeof row.attacks_array === 'string'
+                    ? JSON.parse(row.attacks_array)
+                    : row.attacks_array;
+            } catch (e) {
+                attacks = [];
+            }
+            if (!Array.isArray(attacks)) attacks = attacks ? [attacks] : [];
+
+            mortiesById.set(String(row.owned_morty_id), {
+                owned_morty_id:    String(row.owned_morty_id),
+                morty_id:          String(row.morty_id),
+                level:             Number(row.level || 1),
+                xp:                Number(row.xp || 0),
+                hp:                Number(row.hp || 0),
+                hp_stat:           Number(row.hp_stat || 0),
+                attack_stat:       Number(row.attack_stat || 0),
+                defence_stat:      Number(row.defence_stat || 0),
+                speed_stat:        Number(row.speed_stat || 0),
+                variant:           row.variant || "Normal",
+                is_locked:         toBool(row.is_locked),
+                is_trading_locked: toBool(row.is_trading_locked),
+                fight_pit_id:      row.fight_pit_id && String(row.fight_pit_id).toLowerCase() !== "null"
+                                       ? row.fight_pit_id : null,
+                evolution_points:  Number(row.evolution_points || 0),
+                xp_lower:          Number(row.xp_lower || 0),
+                xp_upper:          Number(row.xp_upper || 0),
+                owned_attacks:     attacks.map((attack, position) => ({
+                    attack_id: String(attack.attack_id || ""),
+                    position:  Number(attack.position ?? position),
+                    pp:        Number(attack.pp || 0),
+                    pp_stat:   Number(attack.pp_stat ?? attack.pp ?? 0)
+                }))
+            });
+        }
+
+        const ownedMorties = deckIds.map(id => mortiesById.get(id)).filter(Boolean);
+        const activeMorty  = ownedMorties.find(m => m.hp > 0) || ownedMorties[0];
+
+        return {
+            player_id:         resolvedPlayerId,
+            username:          String(user.username || "Player"),
+            player_avatar_id:  user.player_avatar_id || "AvatarRickDefault",
+            level:             Number(user.level || 1),
+            xp:                Number(user.xp || 0),
+            streak:            Number(user.streak || 0),
+            coins:             Number(user.coins || 0),
+            coupons:           Number(user.coupons || 0),
+            permits:           Number(user.permits || 0),
+            owned_morties:     ownedMorties,
+            tags:              normalizeTags(user.tags),
+            xp_lower:          Number(user.xp_lower || 0),
+            xp_upper:          Number(user.xp_upper || 0),
+            _meta: {
+                session_id:       playerSessionId,
+                isPlayerInDB:     true,
+                isControlledByAI: false,
+                isRaidBoss:       false
+            },
+            active_owned_morty: activeMorty?.owned_morty_id || "",
+            move_log: {
+                cooldown:       {},
+                count:          {},
+                cooldown_next:  { ITEM: 1 },
+                last_move_type: {}
+            },
+            room_id: String(user.room_id || "")
+        };
+    };
+
+    // The inviter is "player", the responder is "opponent"
+    const player   = await loadPlayer(String(from_player_id));
+    const opponent = await loadPlayer(responderPlayerId);
+
+    if (!player || !opponent) {
+        return res.status(409).json({ success: false, error: "Both players need an active deck" });
+    }
+
+    if (player.room_id !== opponent.room_id) {
+        return res.status(409).json({ success: false, error: "Players are not in the same room" });
+    }
+
+    const battleId      = crypto.randomUUID();
+    const battlePayload = {
+        battle_id:   battleId,
+        battle_type: "PvP",
+        player:      player,
+        opponent:    opponent,
+        meta: {
+            player_id:          player.player_id,
+            opponent_player_id: opponent.player_id,
+            room_id:            player.room_id
+        }
+    };
+
+    Battles.set(battleId, {
+        ...battlePayload,
+        player_id:  player.player_id,
+        room_id:    player.room_id,
+        state:      "ACTIVE",
+        created_at: new Date().toISOString()
+    });
+
+    // Each player sees themselves as "player" and the other as "opponent"
+    await sendPrivateSSE(player.player_id, "battle:start", battlePayload);
+    await sendPrivateSSE(opponent.player_id, "battle:start", {
+        ...battlePayload,
+        player:   opponent,
+        opponent: player
+    });
+
+    await broadcastRoomSSE(player.room_id, "room:user-state-changed", {
+        player_id: player.player_id,
+        state:     "BATTLE"
+    });
+    await broadcastRoomSSE(player.room_id, "room:user-state-changed", {
+        player_id: opponent.player_id,
+        state:     "BATTLE"
+    });
+
+    return res.json({ success: true, accepted: true });
 
   } catch (error) {
     console.error('Error handling battle invite response:', error);
@@ -8628,6 +9233,84 @@ app.post('/session/morty/slots/buy', async (req, res) => {
     }
 });
 
+// -------------------- PLAYER-TO-PLAYER EMOTE --------------------
+app.post('/session/emote/p2p', async (req, res) => {
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    try {
+        const body = req.body || {};
+        // Client may send as body or headers
+        const session_id       = String(body.session_id || req.headers['session_id'] || '');
+        const target_player_id = String(body.player_id  || req.headers['player_id']  || '');
+        const emote            = String(body.emote      || req.headers['emote']      || '');
+
+        if (!session_id || !target_player_id || !emote) {
+            return res.status(400).json({ error: "Missing session_id, player_id or emote" });
+        }
+
+        // Keep emote small + safe
+        if (emote.length > 24 || !/^[a-zA-Z0-9]+$/.test(emote)) {
+            return res.status(400).json({ error: "Invalid emote" });
+        }
+
+        // Resolve the sender
+        const [rows] = await pool.execute(`
+            SELECT player_id, room_id
+            FROM users
+            WHERE session_id = ?
+            LIMIT 1
+        `, [session_id]);
+
+        const u = rows[0];
+
+        if (!u) {
+            return res.status(401).json({ error: "Not authenticated" });
+        }
+
+        const from_player_id = String(u.player_id);
+        const room_id        = String(u.room_id || '');
+
+        if (!room_id || room_id === "0") {
+            return res.status(409).json({ error: "Player is not in a room" });
+        }
+
+        // Verify the target is a real player in the same room
+        const [targetRows] = await pool.execute(`
+            SELECT player_id, room_id
+            FROM users
+            WHERE player_id = ?
+            LIMIT 1
+        `, [target_player_id]);
+
+        const target = targetRows[0];
+
+        if (!target) {
+            return res.status(404).json({ error: "Target player not found" });
+        }
+
+        if (String(target.room_id || '') !== room_id) {
+            return res.status(409).json({ error: "Target player is not in the same room" });
+        }
+
+        // Mark active
+        await pool.execute(`
+            UPDATE users SET last_seen = NOW() WHERE session_id = ? LIMIT 1
+        `, [session_id]);
+
+        // Send the emote privately to the target player only
+        await sendPrivateSSE(target_player_id, "emote:p2p", {
+            player_id: from_player_id,
+            emote:     emote
+        });
+
+        return res.status(200).json({ success: true });
+
+    } catch (e) {
+        console.error(">>> [EMOTE P2P ERROR]:", e);
+        return res.status(500).json({ error: "Server error", detail: e.message });
+    }
+});
 
 
 
@@ -8644,6 +9327,21 @@ app.post('/session/morty/slots/buy', async (req, res) => {
 
 
 // UDP SERVER
+const udpPlayers            = new Map(); // sessionHex -> player object
+const playersByRoom         = new Map(); // roomId -> Map<sessionHex, player>
+const sessionHexToPlayerId  = new Map(); // sessionHex -> player_id (persists until SSE closes)
+const unknownSessionLog     = new Map(); // sessionHex -> last log timestamp
+const udpRateLimiter        = new Map(); // sessionHex -> { count, windowStart }
+const udpViolations         = new Map(); // sessionHex -> { strikes, lastStrike }
+
+const HEARTBEAT_INTERVAL_MS     = 2000;
+const STALE_TIMEOUT_MS          = 300000;   // 5 minutes idle
+const NAT_KEEPALIVE_INTERVAL_MS = 15000;
+const MAX_PACKETS_PER_SECOND    = 30;       // fine — client sends ~20/sec max
+const MAX_MOVE_PER_TICK         = 12;       // fine — accounts for normal movement
+const MAX_STRIKES_BEFORE_KICK   = 8;        // was 2 — needs room for network jitter
+const STRIKE_RESET_MS           = 30000;    // 30s clean play resets count
+
 // ── Stale UDP session cleanup — runs every 30 seconds ──────────────────────
 setInterval(() => {
     const now = Date.now();
@@ -8670,16 +9368,6 @@ setInterval(() => {
         if (now - v.lastStrike > STRIKE_RESET_MS * 2) udpViolations.delete(hex);
     }
 }, 60000);
-
-function hexToUuid(hex) {
-    return (
-        hex.substring(0, 8)  + "-" +
-        hex.substring(8, 12)  + "-" +
-        hex.substring(12, 16) + "-" +
-        hex.substring(16, 20) + "-" +
-        hex.substring(20, 32)
-    );
-}
 
 function registerPlayerUdpSession(playerId, sessionHex, roomId) {
     const idHex    = playerId.replace(/-/g, "");
@@ -8776,7 +9464,7 @@ function addUdpStrike(sessionHex, reason, player) {
     entry.strikes++;
     entry.lastStrike = now;
     udpViolations.set(sessionHex, entry);
-    console.warn(`[UDP VIOLATION ${entry.strikes}/${MAX_STRIKES_BEFORE_KICK}] ${reason} | player=${player?.playerId}`);
+    //console.warn(`[UDP VIOLATION ${entry.strikes}/${MAX_STRIKES_BEFORE_KICK}] ${reason} | player=${player?.playerId}`);
     if (entry.strikes >= MAX_STRIKES_BEFORE_KICK) {
         //console.warn(`[UDP KICK] Strike limit reached for ${player?.playerId}`);
         kickPlayerBySessionHex(sessionHex);
@@ -8815,52 +9503,8 @@ udpServer.on('message', (msg, rinfo) => {
             addUdpStrike(packet.session, `rate limit exceeded (>${MAX_PACKETS_PER_SECOND}/sec)`, player);
             return;
         }
-
-        // ── 2. SEQUENCE REPLAY DETECTION ────────────────────────────────
-        // Client uses a uint8 counter (0-255) so wrap threshold is 128 not 32768
-        if (player.lastSequence !== undefined) {
-            const delta = (packet.sequence - player.lastSequence + 256) % 256;
-            if (delta === 0) {
-                // Exact duplicate packet
-                const kicked = addUdpStrike(packet.session, `duplicate sequence ${packet.sequence}`, player);
-                if (kicked) return;
-                return;
-            }
-            if (delta > 128) {
-                // Sequence going backwards — replay attack
-                const kicked = addUdpStrike(packet.session, `sequence replay: got ${packet.sequence} after ${player.lastSequence}`, player);
-                if (kicked) return;
-                return;
-            }
-        }
-        player.lastSequence = packet.sequence;
-
-        // ── 3. COORDINATE BOUNDS ─────────────────────────────────────────
-        if (packet.x > 150 || packet.y > 150) {
-            const kicked = addUdpStrike(packet.session, `out-of-bounds coords [${packet.x},${packet.y}]`, player);
-            if (kicked) return;
-            return;
-        }
-
-        // ── 4. SPEED HACK DETECTION ──────────────────────────────────────
-		/*
-        const lastPos = livePlayerPositions.get(player.playerId);
-        if (lastPos) {
-            const dx = Math.abs(packet.x - lastPos.x);
-            const dy = Math.abs(packet.y - lastPos.y);
-            if (dx > MAX_MOVE_PER_TICK || dy > MAX_MOVE_PER_TICK) {
-                const kicked = addUdpStrike(
-                    packet.session,
-                    `speed hack: [${lastPos.x},${lastPos.y}] -> [${packet.x},${packet.y}] (${dx},${dy})`,
-                    player
-                );
-                if (kicked) return;
-                return;
-            }
-        }
-		*/
-
-        // ── 5. IP CHANGE LOG ─────────────────────────────────────────────
+		
+        // ── 2. IP CHANGE LOG ─────────────────────────────────────────────
         if (player.address && player.address !== rinfo.address) {
             console.warn(`[UDP IP CHANGE] ${player.playerId}: ${player.address} -> ${rinfo.address}`);
         }
