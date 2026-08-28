@@ -3863,7 +3863,16 @@ app.post('/session/battle/move', async (req, res) => {
             const opponentSide = playerSide === battle.player
                 ? battle.opponent
                 : battle.player;
-            const requestedMortyId = ownedMortyId || moveId;
+
+            const isSwitchAction = ["SWITCH", "FORCE_SWITCH"].includes(type);
+
+            // On SWITCH the client sends:
+            //   owned_morty_id = morty being switched OUT (the fainted/active one)
+            //   move_id        = morty being switched IN  (the target we want)
+            const requestedMortyId = isSwitchAction
+                ? (moveId || ownedMortyId)
+                : (ownedMortyId || moveId);
+
             const mortyCannotBattle = (morty) => Number(morty.hp || 0) <= 0
                 || toBool(morty.dazzled)
                 || toBool(morty.is_dazzled)
@@ -3871,8 +3880,7 @@ app.post('/session/battle/move', async (req, res) => {
             const activeMorty = playerSide.owned_morties.find(
                 morty => String(morty.owned_morty_id) === String(playerSide.active_owned_morty)
             );
-            const isSwitchAction = ["SWITCH", "CHANGE_MORTY", "MORTY_SWITCH"].includes(type)
-                || (type === "MORTY" && requestedMortyId !== "");
+
             const livingMorties = playerSide.owned_morties.filter(
                 morty => !mortyCannotBattle(morty)
             );
@@ -3892,6 +3900,8 @@ app.post('/session/battle/move', async (req, res) => {
             // CASE A: SWITCH — resolves immediately as its own turn
             // ------------------------
             if (isSwitchAction) {
+				console.log(`[PvP SWITCH] player=${playerId} type=${type} requested=${requestedMortyId} awaiting=${JSON.stringify(battle.awaitingSwitch)}`);
+				
                 const nextMorty = playerSide.owned_morties.find(
                     morty => String(morty.owned_morty_id) === String(requestedMortyId)
                 );
@@ -3901,6 +3911,23 @@ app.post('/session/battle/move', async (req, res) => {
                 }
 
                 if (mortyCannotBattle(nextMorty)) {
+                    console.log(`[PvP SWITCH BLOCKED] requested=${requestedMortyId}`);
+                    console.log(`[PvP SWITCH BLOCKED] nextMorty:`, JSON.stringify({
+                        id:          nextMorty.owned_morty_id,
+                        hp:          nextMorty.hp,
+                        hp_type:     typeof nextMorty.hp,
+                        dazzled:     nextMorty.dazzled,
+                        is_dazzled:  nextMorty.is_dazzled,
+                        status:      nextMorty.status
+                    }));
+                    console.log(`[PvP SWITCH BLOCKED] full team:`, JSON.stringify(
+                        playerSide.owned_morties.map(m => ({
+                            id:      m.owned_morty_id,
+                            morty:   m.morty_id,
+                            hp:      m.hp,
+                            blocked: mortyCannotBattle(m)
+                        })), null, 2
+                    ));
                     return res.status(409).json({ success: false, error: "Morty cannot battle with zero HP" });
                 }
 
@@ -6425,7 +6452,7 @@ app.post('/session/battle-bot', async (req, res) => {
         }
 		
 		// Proximity check — player must be close enough to the bot to initiate battle
-        const MAX_BOT_BATTLE_DISTANCE = 8;
+        const MAX_BOT_BATTLE_DISTANCE = 50;
         const playerPos = livePlayerPositions.get(playerId);
 
         if (!playerPos) {
