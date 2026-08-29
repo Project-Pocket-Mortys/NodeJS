@@ -3697,13 +3697,26 @@ async function resolvePvpTurn(battleId) {
         }
     }
 
-    // Flag whoever needs to switch
-    battle.awaitingSwitch = {};
+    // Both players owe a response when anyone faints:
+    //   fainted side -> FORCE_SWITCH (must pick)
+    //   other side   -> ASK_SWITCH   (may switch or decline)
+    battle.awaitingSwitch   = {};
+    battle.awaitingDecision = {};
+
     if (!winnerId) {
         for (const side of [battle.player, battle.opponent]) {
             const active = pvpGetActive(side);
             if (active && pvpMortyFainted(active) && pvpHasLivingMorty(side)) {
                 battle.awaitingSwitch[String(side.player_id)] = true;
+            }
+        }
+        const anyForced = Object.keys(battle.awaitingSwitch).length > 0;
+        if (anyForced) {
+            for (const side of [battle.player, battle.opponent]) {
+                const pid = String(side.player_id);
+                if (!battle.awaitingSwitch[pid]) {
+                    battle.awaitingDecision[pid] = true;
+                }
             }
         }
     }
@@ -3712,7 +3725,7 @@ async function resolvePvpTurn(battleId) {
     const outcomeFor = (forSide, otherSide) => {
         if (winnerId) return String(forSide.player_id) === winnerId ? "WIN" : "LOSE";
         if (battle.awaitingSwitch[String(forSide.player_id)])   return "FORCE_SWITCH";
-        if (battle.awaitingSwitch[String(otherSide.player_id)]) return "ASK_SWITCH";
+        if (battle.awaitingDecision[String(forSide.player_id)]) return "ASK_SWITCH";
         return "CONTINUE";
     };
 
@@ -3748,9 +3761,43 @@ async function resolvePvpTurn(battleId) {
             await broadcastRoomSSE(battle.room_id, "room:user-state-changed", { player_id: p2Id, state: "WORLD" });
         }
         Battles.delete(battleId);
+    } else if (pvpAwaitingAnyResponse(battle)) {
+        //console.log(`[PvP] Switch phase — waiting on both players`);
     } else {
         startPvpTurnTimer(battleId);
     }
+}
+
+// True while either player still owes a switch/continue answer.
+function pvpAwaitingAnyResponse(battle) {
+    return Object.keys(battle.awaitingSwitch   || {}).length > 0
+        || Object.keys(battle.awaitingDecision || {}).length > 0;
+}
+
+// Called after each player answers. Only resumes once BOTH have.
+async function pvpTryResumeAfterSwitchPhase(battleId) {
+    const battle = Battles.get(battleId);
+    if (!battle || battle.state === "ENDED") return;
+
+    if (pvpAwaitingAnyResponse(battle)) {
+        //console.log(`[PvP] Still waiting — switch=${JSON.stringify(battle.awaitingSwitch)} decision=${JSON.stringify(battle.awaitingDecision)}`);
+        return;
+    }
+
+    // Both answered — flush any turn-results we withheld during the switch phase
+    if (battle.deferredNotifies) {
+        for (const [pid, payload] of Object.entries(battle.deferredNotifies)) {
+            //console.log(`[PvP] Flushing deferred notify to ${pid}`);
+            await sendPrivateSSE(pid, "battle:turn-result", payload);
+        }
+        battle.deferredNotifies = {};
+    }
+
+    // Let the SSE writes drain before announcing the new turn
+    await new Promise(resolve => setImmediate(resolve));
+
+    //console.log(`[PvP] Both players answered — resuming battle ${battleId}`);
+    startPvpTurnTimer(battleId);
 }
 
 app.post('/session/battle/move', async (req, res) => {
@@ -3895,12 +3942,27 @@ app.post('/session/battle/move', async (req, res) => {
                     });
                 }
             }
+			
+            // ------------------------
+            // CASE A: NONE — declined the optional switch.
+            // No turn consumed, no SSE emitted, no timer touched.
+            // ------------------------
+            if (type === "NONE") {
+                //console.log(`[PvP] ${playerId} declined optional switch`);
+                if (battle.awaitingDecision) delete battle.awaitingDecision[String(playerId)];
+                await pvpTryResumeAfterSwitchPhase(battleId);
+                return res.json({
+                    success:            true,
+                    battle_id:          battleId,
+                    active_owned_morty: playerSide.active_owned_morty
+                });
+            }
 
             // ------------------------
-            // CASE A: SWITCH — resolves immediately as its own turn
+            // CASE B: SWITCH — resolves immediately as its own turn
             // ------------------------
             if (isSwitchAction) {
-				console.log(`[PvP SWITCH] player=${playerId} type=${type} requested=${requestedMortyId} awaiting=${JSON.stringify(battle.awaitingSwitch)}`);
+				//console.log(`[PvP SWITCH] player=${playerId} type=${type} requested=${requestedMortyId} awaiting=${JSON.stringify(battle.awaitingSwitch)}`);
 				
                 const nextMorty = playerSide.owned_morties.find(
                     morty => String(morty.owned_morty_id) === String(requestedMortyId)
@@ -3911,7 +3973,8 @@ app.post('/session/battle/move', async (req, res) => {
                 }
 
                 if (mortyCannotBattle(nextMorty)) {
-                    console.log(`[PvP SWITCH BLOCKED] requested=${requestedMortyId}`);
+                    //console.log(`[PvP SWITCH BLOCKED] requested=${requestedMortyId}`);
+					/*
                     console.log(`[PvP SWITCH BLOCKED] nextMorty:`, JSON.stringify({
                         id:          nextMorty.owned_morty_id,
                         hp:          nextMorty.hp,
@@ -3928,6 +3991,7 @@ app.post('/session/battle/move', async (req, res) => {
                             blocked: mortyCannotBattle(m)
                         })), null, 2
                     ));
+					*/
                     return res.status(409).json({ success: false, error: "Morty cannot battle with zero HP" });
                 }
 
@@ -3967,14 +4031,26 @@ app.post('/session/battle/move', async (req, res) => {
                     }
                 });
 
-                await sendPrivateSSE(String(battle.player.player_id),   "battle:turn-result",
-                    buildSwitchPayload(battle.player, battle.opponent));
-                await sendPrivateSSE(String(battle.opponent.player_id), "battle:turn-result",
-                    buildSwitchPayload(battle.opponent, battle.player));
+                if (!battle.deferredNotifies) battle.deferredNotifies = {};
 
-                // If nobody else still owes a switch, start the next move timer
-                const stillWaiting = Object.keys(battle.awaitingSwitch || {}).length > 0;
-                if (!stillWaiting) startPvpTurnTimer(battleId);
+                const oppId   = String(opponentSide.player_id);
+                const oppBusy = battle.awaitingSwitch?.[oppId] || battle.awaitingDecision?.[oppId];
+
+                //console.log(`[PvP SWITCH NOTIFY] opp=${oppId} busy=${!!oppBusy}`);
+
+                if (oppBusy) {
+                    // Opponent still deciding — queue BOTH payloads. Neither client
+                    // unlocks early, and both get the SWITCH animation on release.
+                    battle.deferredNotifies[String(playerId)] = buildSwitchPayload(playerSide, opponentSide);
+                    battle.deferredNotifies[oppId]            = buildSwitchPayload(opponentSide, playerSide);
+                } else {
+                    await sendPrivateSSE(String(playerId), "battle:turn-result",
+                        buildSwitchPayload(playerSide, opponentSide));
+                    await sendPrivateSSE(oppId, "battle:turn-result",
+                        buildSwitchPayload(opponentSide, playerSide));
+                }
+
+                await pvpTryResumeAfterSwitchPhase(battleId);
 
                 return res.json({
                     success:            true,
@@ -3984,7 +4060,7 @@ app.post('/session/battle/move', async (req, res) => {
             }
 
             // ------------------------
-            // CASE B: RUN ACTION (immediate — ends the battle)
+            // CASE C: RUN ACTION (immediate — ends the battle)
             // ------------------------
             if (type === "RUN") {
                 if (battle.turnTimeout) {
@@ -4020,7 +4096,7 @@ app.post('/session/battle/move', async (req, res) => {
             }
 
             // ------------------------
-            // CASE C: ATTACK ACTION — buffered until BOTH players submit
+            // CASE D: ATTACK ACTION — buffered until BOTH players submit
             // ------------------------
             if (type === "ATTACK") {
                 if (!battle.pendingMoves) battle.pendingMoves = {};
@@ -4058,7 +4134,7 @@ app.post('/session/battle/move', async (req, res) => {
 
                 // Other player hasn't moved yet — hold the turn
                 if (!battle.pendingMoves[opponentId]) {
-                    console.log(`[PvP] ${myId} submitted, waiting for ${opponentId}`);
+                    //console.log(`[PvP] ${myId} submitted, waiting for ${opponentId}`);
                     return res.json({ success: true, waiting: true });
                 }
 
@@ -4572,9 +4648,7 @@ app.post('/session/battle/move', async (req, res) => {
                                     xp_upper: 64
                                 }]
                             },
-							*/
                             xp_datas: xpDatas,
-							/*
                             rewards: [{
                                 type: "ITEM",
                                 item_id: "ItemCircuitBoard",
@@ -6452,7 +6526,7 @@ app.post('/session/battle-bot', async (req, res) => {
         }
 		
 		// Proximity check — player must be close enough to the bot to initiate battle
-        const MAX_BOT_BATTLE_DISTANCE = 50;
+        const MAX_BOT_BATTLE_DISTANCE = 60;
         const playerPos = livePlayerPositions.get(playerId);
 
         if (!playerPos) {
