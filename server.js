@@ -896,6 +896,7 @@ app.post('/user/login', async (req, res) => {
     const { secret, consent_identifier } = req.body;
 
     try {
+		const ip = getUserIP(req);
         const [rows] = await pool.execute('SELECT * FROM users WHERE secret = ?', [secret]);
         const user = rows[0];
 
@@ -904,6 +905,9 @@ app.post('/user/login', async (req, res) => {
                 error: { code: "SECRET_INVALID" }
             });
         }
+		
+		// Update last seen IP
+        await pool.execute('UPDATE users SET last_seen_ip = ? WHERE player_id = ?', [ip, user.player_id]);
 
         const player_id = user.player_id;
         const username = user.username;
@@ -5493,13 +5497,17 @@ app.post('/user/register', async (req, res) => {
     try {
         connection = await pool.getConnection();
 		
-		// Check if users ip address already exists
-        //const [useriPCheck] = await connection.execute('SELECT 1 FROM users WHERE created_with_ip = ?', [ip]);
-        //if (useriPCheck.length > 0) {
-        //    return res.status(400).json({
-        //        error: { code: "USERNAME_LOGIN_ERROR" }
-        //    });
-        //}
+		// Check if IP address already has 2+ accounts
+		const [ipAccountCount] = await connection.execute(
+    		'SELECT COUNT(*) AS count FROM users WHERE created_with_ip = ?',
+    		[ip]
+		);
+
+		if (ipAccountCount[0].count >= 2) {
+    		return res.status(400).json({
+        		error: { code: "USERNAME_INVALID" }
+    		});
+		}
 
         // Check if a recovery code layout entry profile exists
         // Replaces: SELECT id, recovery_code_hash FROM users LIMIT 1
@@ -5583,7 +5591,26 @@ app.post('/user/register', async (req, res) => {
                 await connection.execute(`
                     INSERT INTO owned_morties (player_id, owned_morty_id, morty_id, level, xp, hp, hp_stat, attack_stat, defence_stat, variant, speed_stat, is_locked, is_trading_locked, fight_pit_id, evolution_points, xp_lower, xp_upper, attacks_array)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                `, [player_id, owned_morty_id, 'MortyDefault', '5', '125', '20', '20', '11', '10', 'Normal', '10', '0', 'false', 'null', '0', '125', '216', '{"attack_id":"AttackOutburst","pp":12,"pp_stat":12,"position":0}']);
+                `, [
+                    player_id,
+                    owned_morty_id,
+                    'MortyDefault',
+                    5,        // int, not '5'
+                    125,      // int, not '125'
+                    20,       // int
+                    20,       // int
+                    11,       // int
+                    10,       // int
+                    'Normal',
+                    10,       // int
+                    0,        // int, not '0'
+                    false,    // boolean, not 'false'
+                    null,     // null, not 'null'
+                    0,        // int
+                    125,      // int
+                    216,      // int
+                    '{"attack_id":"AttackOutburst","pp":12,"pp_stat":12,"position":0}'
+                ]);
 
                 await connection.commit();
                 success = true;

@@ -1,0 +1,278 @@
+#Options -Indexes
+RewriteEngine On
+
+# Disable Apache's automatic slash redirect for this path
+DirectorySlash Off
+
+#when behind proxy
+RewriteCond %{HTTP:X-Forwarded-Proto} =https
+# debug
+#RewriteRule ^(.*)$ http://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
+
+RewriteCond %{REQUEST_URI} ^/session/heal$
+RewriteRule ^session/heal$ /session/heal/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/owned_morties/absorb$
+RewriteRule ^session/owned_morties/absorb$ /session/owned_morties/absorb/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/decks/slots/buy$
+RewriteRule ^session/decks/slots/buy$ /session/decks/slots/buy/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/deck/set-active$
+RewriteRule ^session/deck/set-active$ /session/deck/set-active/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/deck/edit$
+RewriteRule ^session/deck/edit$ /session/deck/edit/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/battle-wild-morty$
+RewriteRule ^session/battle-wild-morty$ /session/battle-wild-morty/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/linkaccount$
+RewriteRule ^linkaccount$ /linkaccount/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/inappdeletion/request-account-deletion$
+RewriteRule ^inappdeletion/request-account-deletion$ /inappdeletion/request-account-deletion/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/collect-pickup$
+RewriteRule ^session/collect-pickup$ /session/collect-pickup/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/battle-boss$
+RewriteRule ^session/battle-boss$ /session/battle-boss/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/emote/room$
+RewriteRule ^session/emote/room$ /session/emote/room/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/shard/scores$
+RewriteRule ^shard/scores$ /shard/scores/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/event/brackets$
+RewriteRule ^event/brackets$ /event/brackets/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/player-avatar/set-active$
+RewriteRule ^session/player-avatar/set-active$ /session/player-avatar/set-active/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/player-avatar/buy$
+RewriteRule ^session/player-avatar/buy$ /session/player-avatar/buy/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/buy-item$
+RewriteRule ^session/buy-item$ /session/buy-item/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/event/pendingRewards$
+RewriteRule ^event/pendingRewards$ /event/pendingRewards/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/event/check$
+RewriteRule ^event/check$ /event/check/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/lte/fyre/events/list$
+RewriteRule ^lte/fyre/events/list$ /lte/fyre/events/list/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/moving-mortys/events/list$
+RewriteRule ^moving-mortys/events/list$ /moving-mortys/events/list/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/arena/battle/bot$
+RewriteRule ^arena/battle/bot$ /arena/battle/bot/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/arena/energy/fetch$
+RewriteRule ^arena/energy/fetch$ /arena/energy/fetch/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/arena/scores/list$
+RewriteRule ^arena/scores/list$ /arena/scores/list/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/arena/rewards/list$
+RewriteRule ^arena/rewards/list$ /arena/rewards/list/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/arena/rewards/pending/list$
+RewriteRule ^arena/rewards/pending/list$ /arena/rewards/pending/list/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/arena/events/list$
+RewriteRule ^arena/events/list$ /arena/events/list/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/challenge/list$
+RewriteRule ^session/challenge/list$ /session/challenge/list/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/gacha$
+RewriteRule ^session/gacha$ /session/gacha/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/gacha-info$
+RewriteRule ^session/gacha-info$ /session/gacha-info/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/promos/active$
+RewriteRule ^promos/active$ /promos/active/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/is-gdpr$
+RewriteRule ^is-gdpr$ /is-gdpr/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/inappdeletion/get-account-data-storage-time$
+RewriteRule ^inappdeletion/get-account-data-storage-time$ /inappdeletion/get-account-data-storage-time/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/iap/display/list$
+RewriteRule ^iap/display/list$ /iap/display/list/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/user/register$
+RewriteRule ^user/register$ /user/register/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/user/login$
+RewriteRule ^user/login$ /user/login/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/sse$
+RewriteRule ^sse$ /sse/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/ping-dynamic$
+RewriteRule ^session/ping-dynamic$ /session/ping-dynamic/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/decks/slots/config$
+RewriteRule ^decks/slots/config$ /decks/slots/config/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/morty/slots/config$
+RewriteRule ^morty/slots/config$ /morty/slots/config/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/trading/config$
+RewriteRule ^trading/config$ /trading/config/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/player-details$
+RewriteRule ^session/player-details$ /session/player-details/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/player-avatar/migrate$
+RewriteRule ^session/player-avatar/migrate$ /session/player-avatar/migrate/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/friend/list$
+RewriteRule ^session/friend/list$ /session/friend/list/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/friend/search$
+RewriteRule ^session/friend/search$ /session/friend/search/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/friend/request$
+RewriteRule ^session/friend/request$ /session/friend/request/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/friend/remove$
+RewriteRule ^session/friend/remove$ /session/friend/remove/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/friend/response$
+RewriteRule ^session/friend/response$ /session/friend/response/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/dimensions/query$
+RewriteRule ^session/dimensions/query$ /session/dimensions/query/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/join-room$
+RewriteRule ^session/join-room$ /session/join-room/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/room-details$
+RewriteRule ^session/room-details$ /session/room-details/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/leave-room$
+RewriteRule ^session/leave-room$ /session/leave-room/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/state$
+RewriteRule ^session/state$ /session/state/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/battle-bot$
+RewriteRule ^session/battle-bot$ /session/battle-bot/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/battle/ready$
+RewriteRule ^session/battle/ready$ /session/battle/ready/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/battle/move$
+RewriteRule ^session/battle/move$ /session/battle/move/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/owned_morties/learn-attacks$
+RewriteRule ^session/owned_morties/learn-attacks$ /session/owned_morties/learn-attacks/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/trading/get-trades$
+RewriteRule ^trading/get-trades$ /trading/get-trades/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/trading/request-morty$
+RewriteRule ^trading/request-morty$ /trading/request-morty/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/trading/cancel-trade$
+RewriteRule ^trading/cancel-trade$ /trading/cancel-trade/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/trading/request-morty$
+RewriteRule ^trading/request-morty$ /trading/request-morty/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/trading/offer-response$
+RewriteRule ^trading/offer-response$ /trading/offer-response/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/trading/offer-morty$
+RewriteRule ^trading/offer-morty$ /trading/offer-morty/ [L]
+
+
+RewriteCond %{REQUEST_URI} ^/session/use-item$
+RewriteRule ^session/use-item$ /session/use-item/ [L]
+
+RewriteCond %{REQUEST_URI} ^/sp/gacha-info$
+RewriteRule ^sp/gacha-info$ /sp/gacha-info/ [L]
+
+RewriteCond %{REQUEST_URI} ^/time$
+RewriteRule ^time$ /time/ [L]
+
+# Redirect requests for manifest.json to the GitHub URL
+RewriteRule ^manifest\.json$ https://raw.githubusercontent.com/Project-Pocket-Mortys/Project-Pocket-Mortys.github.io/refs/heads/main/Aliases/rat/Android/manifest.json [R=302,L]
+
+RewriteRule ^rat\.json$ - [L]
+
+# allow your API paths
+RewriteRule ^(assets|support|newc137|api|phpmyadmin|sp|lib|gacha-info|is-gdpr|AssetBundles|AssetBundle-android:1011-ios:1011__7b175320|Aliases|rat|Android|Status|user|login|sse|session|ping-dynamic|inappdeletion|get-account-data-storage-time|iap|display|list|morty|slots|config|arena|rewards|pending|decks|trading|event|events|moving-mortys|lte|fyre|promos|shard)/ - [L]
+
+# block everything else
+#RewriteRule ^ - [F,L]
