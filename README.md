@@ -47,7 +47,7 @@ This will install the currently required Node.js dependencies.
 Once the dependencies have been installed, configure the server and database connection according to your environment before starting the server.
 
 ## To Do
-
+* Moving Mortys Event (fix morty spawning by sending it to the /SSE for the current player and battling)
 * Battle friends
 * PVP (XP calculated earned win or loss. Use Items as well.)
 * Raid & other event Battles

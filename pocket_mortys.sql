@@ -65,7 +65,8 @@ INSERT INTO `deck_config` (`id`, `config_id`, `starting_deck_slots`, `max_deck_s
 
 CREATE TABLE `events` (
   `id` int NOT NULL,
-  `raid_event_id` text COLLATE utf8mb4_general_ci,
+  `is_raid` int NOT NULL DEFAULT '0',
+  `event_id` text CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
   `shard_id` text COLLATE utf8mb4_general_ci,
   `current_state` text COLLATE utf8mb4_general_ci NOT NULL,
   `world_id` int DEFAULT NULL,
@@ -83,9 +84,9 @@ CREATE TABLE `events` (
   `ticket_buy_in` text COLLATE utf8mb4_general_ci
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
-INSERT INTO `events` (`id`, `raid_event_id`, `shard_id`, `current_state`, `world_id`, `spawn_location`, `boss_id`, `asset_id`, `threat_lvl`, `total_damage`, `initial_health`, `max_health_bars`, `event_state_next_timestamp`, `has_ran`, `permit_start`, `permit_buy_in`, `ticket_buy_in`) VALUES
-(1, 'RaidBossKillerAsteroid_2025', '78496e72-fb88-11f0-b2fd-8b24d97da62f', 'build_up', 1, '37,58', 'killer_asteroid', 'RaidBossKillerAsteroid', 10, 0, 30860800, 60275, '2030-01-01 00:00:00', 0, '50', '1', '0');
-
+INSERT INTO `events` (`id`, `is_raid`, `event_id`, `shard_id`, `current_state`, `world_id`, `spawn_location`, `boss_id`, `asset_id`, `threat_lvl`, `total_damage`, `initial_health`, `max_health_bars`, `event_state_next_timestamp`, `has_ran`, `permit_start`, `permit_buy_in`, `ticket_buy_in`) VALUES
+(1, 0, 'RaidBossKillerAsteroid_2025', '78496e72-fb88-11f0-b2fd-8b24d97da62f', 'build_up', 1, '37,58', 'killer_asteroid', 'RaidBossKillerAsteroid', 10, 0, 30860800, 60275, '2028-01-01 00:00:00', 0, '50', '1', '0'),
+(2, 0, 'moving-mortys', '1a82771a-5b6c-435c-9942-017121ae0b4a', 'active', 1, '35,56', NULL, 'MortyMiami', NULL, NULL, NULL, NULL, '2026-10-16 03:10:06', 0, NULL, NULL, NULL);
 
 CREATE TABLE `friend_list` (
   `id` int NOT NULL,

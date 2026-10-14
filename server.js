@@ -382,72 +382,94 @@ setInterval(async () => {
 
             if (typeof Battles !== 'undefined' && Battles instanceof Map) {
 
-                // ============================================================
-                // RETURN ANY WILD MORTIES BELONGING TO THIS TIMED-OUT PLAYER
-                // ============================================================
-                for (const battle of Battles.keys()) {
+                for (const [bid, b] of Battles.entries()) {
+                    if (!b || typeof b !== "object") continue;
 
-                    if (!battle || typeof battle !== 'object') continue;
-                    if (String(battle.battle_type || "") !== "PvWM") continue;
+                    // ── PvWM ────────────────────────────────────────────────
+                    if (b.battle_type === "PvWM") {
+                        const bPlayerId = String(b.player_id || b.player?.player_id || "");
+                        if (bPlayerId !== player_id) continue;
 
-                    const battlePlayerId = String(battle.meta?.player_id || "");
-                    if (battlePlayerId !== player_id) continue;
+                        if (b.timeoutId) clearTimeout(b.timeoutId);
 
-                    const battleRoomId = String(battle.meta?.room_id || room_id);
-                    const wildMortyId  = String(battle.meta?.wild_morty_id || "");
+                        const bRoomId     = String(b.room_id || b.meta?.room_id || room_id);
+                        const wildMortyId = String(b.meta?.wild_morty_id || "");
 
-                    const roomMorties = SpawnedMorties.get(battleRoomId);
-                    if (roomMorties && wildMortyId) {
-                        const wildPayload = roomMorties.find(
-                            m => String(m.wild_morty_id) === wildMortyId
-                        );
-                        if (wildPayload) {
-                            wildPayload.state    = "WORLD";
-                            wildPayload._updated = new Date().toISOString();
-                            SpawnedMorties.set(battleRoomId, roomMorties);
-                            await broadcastRoomSSE(battleRoomId, "room:wild-morty-state-changed", {
-                                wild_morty_id: wildMortyId,
-                                state: "WORLD"
-                            });
+                        const roomMorties = SpawnedMorties.get(bRoomId);
+                        if (roomMorties && wildMortyId) {
+                            const wildPayload = roomMorties.find(
+                                m => String(m.wild_morty_id) === wildMortyId
+                            );
+                            if (wildPayload) {
+                                wildPayload.state    = "WORLD";
+                                wildPayload._updated = new Date().toISOString();
+                                SpawnedMorties.set(bRoomId, roomMorties);
+                                await broadcastRoomSSE(bRoomId, "room:wild-morty-state-changed", {
+                                    wild_morty_id: wildMortyId,
+                                    state: "WORLD"
+                                });
+                            }
                         }
+
+                        //console.log(`[Timeout] Freed PvWM battle ${bid} for ${player_id}`);
+                        Battles.delete(bid);
+                        continue;
                     }
 
-                    Battles.delete(battle);
-                }
+                    // ── PvB ─────────────────────────────────────────────────
+                    if (b.battle_type === "PvB") {
+                        if (String(b.player_id) !== player_id) continue;
 
-                // ============================================================
-                // RETURN ANY BOTS BELONGING TO THIS TIMED-OUT PLAYER
-                // ============================================================
-                for (const [pvbBattleId, pvbBattle] of Battles.entries()) {
+                        if (b.timeoutId) clearTimeout(b.timeoutId);
 
-                    if (!pvbBattle || typeof pvbBattle !== "object") continue;
-                    if (pvbBattle.battle_type !== "PvB") continue;
-                    if (String(pvbBattle.player_id) !== player_id) continue;
+                        const bRoomId  = String(b.room_id || room_id);
+                        const bots     = SpawnedBots.get(bRoomId) || [];
+                        const staleBot = bots.find(x => String(x.bot_id) === String(b.bot_id));
+                        if (staleBot) {
+                            staleBot.state    = "WORLD";
+                            staleBot._updated = new Date().toISOString();
+                        }
 
-                    // Cancel the scheduled timeout — we're handling cleanup now
-                    if (pvbBattle.timeoutId) clearTimeout(pvbBattle.timeoutId);
+                        await broadcastRoomSSE(bRoomId, "room:bot-state-changed", {
+                            bot_id: b.bot_id, state: "WORLD"
+                        });
+                        await broadcastRoomSSE(bRoomId, "room:user-state-changed", {
+                            player_id: player_id, state: "WORLD"
+                        });
 
-                    const pvbRoomId   = String(pvbBattle.room_id || room_id);
-                    const pvbRoomBots = SpawnedBots.get(pvbRoomId) || [];
-                    const staleBot    = pvbRoomBots.find(
-                        b => String(b.bot_id) === String(pvbBattle.bot_id)
-                    );
-
-                    if (staleBot) {
-                        staleBot.state    = "WORLD";
-                        staleBot._updated = new Date().toISOString();
+                        //console.log(`[Timeout] Freed PvB battle ${bid} for ${player_id}`);
+                        Battles.delete(bid);
+                        continue;
                     }
+					/*
+                    // ── PvP — award the win to whoever is still connected ────
+                    if (b.battle_type === "PvP") {
+                        const p1 = String(b.player?.player_id || "");
+                        const p2 = String(b.opponent?.player_id || "");
+                        if (p1 !== player_id && p2 !== player_id) continue;
 
-                    await broadcastRoomSSE(pvbRoomId, "room:bot-state-changed", {
-                        bot_id: pvbBattle.bot_id,
-                        state: "WORLD"
-                    });
-                    await broadcastRoomSSE(pvbRoomId, "room:user-state-changed", {
-                        player_id: player_id,
-                        state: "WORLD"
-                    });
+                        if (b.turnTimeout) clearTimeout(b.turnTimeout);
+                        b.state = "ENDED";
 
-                    Battles.delete(pvbBattleId);
+                        const survivorId = (p1 === player_id) ? p2 : p1;
+
+                        await sendPrivateSSE(survivorId, "battle:turn-result", {
+                            battle_id:  bid,
+                            outcome:    "WIN",
+                            turn_datas: [],
+                            player_datas: { player: { attacks_to_learn: [] }, opponent: {} },
+                            battle_abandoned: true
+                        });
+
+                        const bRoomId = String(b.room_id || room_id);
+                        await broadcastRoomSSE(bRoomId, "room:user-state-changed", { player_id: p1, state: "WORLD" });
+                        await broadcastRoomSSE(bRoomId, "room:user-state-changed", { player_id: p2, state: "WORLD" });
+
+                        console.log(`[Timeout] PvP battle ${bid} abandoned by ${player_id}, win to ${survivorId}`);
+                        Battles.delete(bid);
+                        continue;
+                    }
+					*/
                 }
             }
 
@@ -635,11 +657,14 @@ function broadcastRoomSSE(roomId, eventName, payload, excludePlayerId = null) {
             continue;
         }
 
-        try {
-            sseSend(eventName, data);
-        } catch (err) {
-            console.error(`SSE failed for ${connectionPlayerId}:`, err);
-        }
+            try {
+                sseSend(eventName, data);
+            } catch (err) {
+                roomConnections.delete(sseSend);
+                if (roomConnections.size === 0) {
+                    activeRoomSseConnections.delete(String(roomId));
+                }
+            }
     }
 }
 
@@ -821,6 +846,56 @@ function getTotalXpForLevel(level) {
     return total;
 }
 
+// -------------------- IronSource S2S Reward Callback --------------------
+app.get('/api/ads/ironsource/reward', async (req, res) => {
+    // Set headers
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    try {
+        // Extract parameters sent by ironSource LevelPlay
+        // Depending on your dashboard setup, parameters can be query params (req.query) or body params (req.body)
+        const userId = req.query.user_id || req.query.userId || req.query.sid;
+        const rewards = req.query.rewards || req.query.reward;
+        const eventId = req.query.event_id || req.query.eventId || req.query.oid;
+        const timestamp = req.query.timestamp;
+        const signature = req.query.signature || req.query.hmac;
+
+        // Your private key from the ironSource LevelPlay dashboard settings
+        const privateKey = process.env.IRONSOURCE_PRIVATE_KEY || "ba1375";
+
+        // Optional: Validate signature (Formula: md5(timestamp + eventId + userId + rewards + privateKey))
+        if (signature && timestamp && eventId && userId && rewards) {
+            const crypto = require('crypto');
+            // Ensure userId is URL-decoded if ironSource sends it URL-encoded
+            const decodedUserId = decodeURIComponent(userId);
+            const rawString = `${timestamp}${eventId}${decodedUserId}${rewards}${privateKey}`;
+            const generatedSignature = crypto.createHash('md5').update(rawString).digest('hex');
+
+            if (generatedSignature !== signature) {
+                console.warn(`[IronSource S2S] Signature mismatch. Received: ${signature}, Generated: ${generatedSignature}`);
+                return res.status(403).send("Signature verification failed");
+            }
+        }
+
+        // TODO: Check for duplicate eventId in your database to prevent double-crediting
+        // const isDuplicate = await checkAndSaveEventId(eventId);
+        // if (isDuplicate) { return res.status(400).send("Duplicate event ID"); }
+
+        // TODO: Grant currency or item to the player in your database
+        // await grantPlayerRewards(userId, rewards);
+
+        console.log(`[IronSource S2S Success] Rewarded user ${userId} with ${rewards} units. Event ID: ${eventId}`);
+
+        // LevelPlay expects the eventId followed by ":OK" with a 200 OK status to confirm success
+        return res.status(200).send(`${eventId}:OK`);
+
+    } catch (err) {
+        console.error("[IronSource S2S Error]", err);
+        return res.status(500).send("SERVER_ERROR");
+    }
+});
+
 app.post('/trading/config', (req, res) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('X-Powered-By', 'Express');
@@ -915,7 +990,7 @@ app.post('/user/login', async (req, res) => {
         const tags = user.tags;
         
         const session_id = crypto.randomUUID(); 
-        const ping_url = 'https://game.conspiracyrick.com/session/ping-dynamic';
+        const ping_url = 'https://rat.game.bps-pmnet.com/session/ping-dynamic';
         
         const iat = Math.floor(Date.now() / 1000); 
         const exp = iat + 60; 
@@ -949,7 +1024,7 @@ app.post('/user/login', async (req, res) => {
         const jwt = `${base64Header}.${base64Payload}.${base64Signature}`;
 
         const responseData = {
-            session_url: `https://game.conspiracyrick.com/sse/?token=${jwt}`,
+            session_url: `https://rat.game.bps-pmnet.com/sse/?token=${jwt}`,
             session_url_ttl: "60"
         };
 
@@ -1018,9 +1093,17 @@ app.get('/sse', async (req, res) => {
     res.setHeader('X-Accel-Buffering', 'no');
 
     const sseSend = (event, dataJson, id = null) => {
-        //if (id !== null) res.write(`id: ${id}\n`);
-        res.write(`event: ${event}\n`);
-        res.write(`data: ${dataJson}\n\n`);
+        // Stream already closed — drop silently instead of throwing
+        if (!res.writable || res.writableEnded) return;
+        try {
+            //if (id !== null) res.write(`id: ${id}\n`);
+            res.write(`event: ${event}\n`);
+            res.write(`data: ${dataJson}\n\n`);
+        } catch (err) {
+            if (err.code !== 'ERR_STREAM_WRITE_AFTER_END') {
+                console.error(`[SSE WRITE ERROR] ${player_id}:`, err.message);
+            }
+        }
     };
 
     const token = req.query.token || null;
@@ -1044,7 +1127,7 @@ app.get('/sse', async (req, res) => {
 
     const player_id = String(user.player_id);
     const tags = normalizeTags(user.tags);
-    const ping_url = String(profile?.ping_url || "https://game.conspiracyrick.com/session/ping-dynamic");
+    const ping_url = String(profile?.ping_url || "https://rat.game.bps-pmnet.com/session/ping-dynamic");
 
     // --- 1. REGISTER CONNECTION FOR DYNAMIC PING ROUTING ---
     const sessionHex = session_id.replaceAll("-", "");
@@ -1093,13 +1176,11 @@ app.get('/sse', async (req, res) => {
         activeSseConnections.delete(player_id);
         sessionHexToPlayerId.delete(sessionHex);
 
-        const roomConnections = activeRoomSseConnections.get(room_id);
-
-        if (roomConnections) {
-            roomConnections.delete(sseSend);
-
-            if (roomConnections.size === 0) {
-                activeRoomSseConnections.delete(room_id);
+        // room_id may have changed since this handler was registered — sweep
+        // every room to be certain this sseSend isn't left behind anywhere.
+        for (const [rid, conns] of activeRoomSseConnections.entries()) {
+            if (conns.delete(sseSend) && conns.size === 0) {
+                activeRoomSseConnections.delete(rid);
             }
         }
     });
@@ -2967,7 +3048,7 @@ app.post('/event/check', async (req, res) => {
         // 3) Query the priority event lifecycle state from the events database schema
         const [eventRows] = await pool.execute(`
             SELECT * FROM events 
-            WHERE current_state IN ('build_up', 'active')
+            WHERE is_raid = 1 AND current_state IN ('build_up', 'active')
             ORDER BY 
                 CASE current_state
                     WHEN 'active' THEN 0
@@ -2985,7 +3066,7 @@ app.post('/event/check', async (req, res) => {
             if (state === "active" || state === "build_up") {
                 // Construct payload schema with corrected clean timestamp layout
                 const payload = {
-                    raid_event_id: String(event.raid_event_id || ""),
+                    raid_event_id: String(event.event_id || ""),
                     shard_id: String(event.shard_id || ""),
                     current_state: String(event.current_state || ""),
                     world_id: event.world_id !== undefined ? parseInt(event.world_id, 10) : world_id,
@@ -3445,7 +3526,46 @@ app.post('/session/battle-wild-morty', async (req, res) => {
             sseSend("battle:start", payloadStr);
         }
 		
-		Battles.set(finalBroadcastPayload);
+        // ── 5-minute timeout: free the morty if the battle is abandoned ──────
+        const PVWM_TIMEOUT_MS = 5 * 60 * 1000;
+
+        const pvwmTimeoutId = setTimeout(async () => {
+            const activeBattle = Battles.get(battleId);
+            if (!activeBattle || activeBattle.state === "ENDED") return;
+
+            console.log(`[PvWM TIMEOUT] Battle ${battleId} expired — freeing morty ${wildMortyIdInput}`);
+
+            const currentMorties = SpawnedMorties.get(roomId) || [];
+            const freed = currentMorties.find(
+                m => String(m.wild_morty_id) === String(wildMortyIdInput)
+            );
+            if (freed) {
+                freed.state    = "WORLD";
+                freed._updated = new Date().toISOString();
+                SpawnedMorties.set(roomId, currentMorties);
+            }
+
+            await broadcastRoomSSE(roomId, "room:wild-morty-state-changed", {
+                wild_morty_id: wildMortyIdInput,
+                state: "WORLD"
+            });
+            await broadcastRoomSSE(roomId, "room:user-state-changed", {
+                player_id: playerId,
+                state: "WORLD"
+            });
+
+            Battles.delete(battleId);
+        }, PVWM_TIMEOUT_MS);
+
+        // Store keyed by battleId (was Battles.set(obj) with no value — a bug)
+        Battles.set(battleId, {
+            ...finalBroadcastPayload,
+            player_id:  playerId,
+            room_id:    roomId,
+            state:      "ACTIVE",
+            created_at: new Date().toISOString(),
+            timeoutId:  pvwmTimeoutId
+        });
 
         SpawnedMorties.set(roomId, roomMorties);
 
@@ -4737,6 +4857,7 @@ app.post('/session/battle/move', async (req, res) => {
                 });
             }
 			
+			if (battle.timeoutId) clearTimeout(battle.timeoutId);
 			Battles.delete(battleId);
         } // end of PvWM battle
 		
@@ -5708,7 +5829,6 @@ for (let morty of mortyRows) {
         if (connection) connection.release();
     }
 });
-
 // -------------------- dispense-item --------------------
 app.post('/session/dispense-item', async (req, res) => {
     // Match the headers from your PHP script
@@ -8123,31 +8243,157 @@ app.post('/arena/rewards/pending/list', async (req, res) => {
     }
 });
 
+
 app.post('/moving-mortys/events/list', async (req, res) => {
-    // Set headers expected by the Unity client
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.setHeader('X-Powered-By', 'Express');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Vary', 'Accept-Encoding');
 
     try {
-        // Return active event data or schedule for the next event
-        const responsePayload = {
-            event_data: [],
-            next_event_active: "2026-08-30T14:00:00.000Z"
-        };
+        const [rows] = await pool.execute(`
+            SELECT
+                event_id,
+                asset_id,
+                current_state,
+                event_state_next_timestamp
+            FROM events
+            ORDER BY event_state_next_timestamp ASC
+        `);
 
-        return res.status(200).json(responsePayload);
+        const now = Date.now();
 
-    } catch (err) {
-        console.error("Error handling /moving-mortys/events/list:", err);
+        // Find an event whose end timestamp is still in the future.
+        const upcomingOrActiveEvent = rows.find(row => {
+            if (!row.event_state_next_timestamp) return false;
 
+            const eventTimestamp =
+                new Date(row.event_state_next_timestamp).getTime();
+
+            return Number.isFinite(eventTimestamp) &&
+                eventTimestamp > now;
+        });
+
+        if (upcomingOrActiveEvent) {
+            const eventEnd = new Date(
+                upcomingOrActiveEvent.event_state_next_timestamp
+            ).toISOString();
+
+            // Only display the event if it is currently active.
+            if (String(upcomingOrActiveEvent.current_state).toLowerCase() === 'active') {
+                return res.status(200).json({
+                    event_data: [{
+                        event_id: upcomingOrActiveEvent.event_id,
+                        reward_morty_id: upcomingOrActiveEvent.asset_id,
+						
+						easy_mode: {
+						    mode_id: 'moving-mortys-easy',
+						    cost_of_entry: 10,
+						    dimensions_available: 1,
+						    shiny_reward_chance: 0.01,
+						    pulsing_reward_chance: 0.01
+						},
+
+						hard_mode: {
+						    mode_id: 'moving-mortys-hard',
+						    cost_of_entry: 10,
+						    dimensions_available: 1,
+						    shiny_reward_chance: 0.02,
+						    pulsing_reward_chance: 0.02
+						},			
+                        event_end: eventEnd
+                    }]					
+                });
+            }
+
+            // No active event: provide the next scheduled event.
+            return res.status(200).json({
+                event_data: [],
+                next_event_active: eventEnd
+            });
+        }
+
+        // No active or upcoming event.
         return res.status(200).json({
+            event_data: []
+        });
+    } catch (err) {
+        console.error('[Moving Mortys Events List]', err);
+
+        return res.status(500).json({
             event_data: [],
-            next_event_active: new Date().toISOString()
+            error: 'SERVER_ERROR',
+            debug: err.message
         });
     }
 });
+
+
+app.post('/moving-mortys/purchase-pass', async (req, res) => {
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    const eventId = String(
+        req.body?.event_id ?? req.query?.event_id ?? 'moving-mortys-001'
+    );
+
+    try {
+        const [rows] = await pool.execute(
+            `SELECT *
+             FROM events
+             WHERE event_id = ?
+             LIMIT 1`,
+            [eventId]
+        );
+
+        const event = rows[0];
+
+        if (!event) {
+            return res.status(404).json({
+                error: 'EVENT_NOT_FOUND',
+                event_id: eventId
+            });
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+
+        // Debug-only reconstruction of PurchasePassResponse.
+        const response = {
+            coins: 0,
+            coupons: 0,
+            shard_id: String(event.shard_id ?? ''),
+            update_data: {
+                event_id: String(event.event_id ?? ''),
+                mode_id: String(
+                    req.body?.mode_id ??
+                    req.query?.mode_id ??
+                    ''
+                ),
+                shard_id: String(event.shard_id ?? ''),
+                dimension: Number(event.world_id ?? 1),
+                location: {
+                    x: 35,
+                    z: 56
+                },
+                previous_timestamp: now,
+                timestamp: now,
+                has_claimed_reward: false,
+                next_event_active: null
+            }
+        };
+
+        return res.status(200).json(response);
+    } catch (err) {
+        console.error(
+            '[Moving Mortys Purchase Pass] Database error:',
+            err.message
+        );
+
+        return res.status(500).json({
+            error: 'SERVER_ERROR'
+        });
+    }
+});
+
 
 app.post('/inappdeletion/get-account-data-storage-time', (req, res) => {
     // 1. Set required HTTP response headers
@@ -9699,6 +9945,7 @@ setInterval(() => {
 udpServer.bind(13001, '0.0.0.0', () => {
     console.log("UDP Movement Engine listening on 13001");
 });
+
 
 const PORT = 3000;
 const HOST = '0.0.0.0';
